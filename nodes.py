@@ -2647,36 +2647,68 @@ def _fit_length(samples, length):
     return torch.nn.functional.pad(samples, (0, length - samples.shape[-1]))
 
 
-def _ensure_modules(requirements, purpose):
+def _ensure_modules(requirements, purpose, upgrade=False):
     """Install missing Python modules into ComfyUI's own environment.
 
     requirements: {import_name: pip_spec}. REAPER users should never need a
     terminal, so missing optional modules are installed on first use with the
     interpreter that runs ComfyUI (sys.executable). Installed packages that
-    are already satisfied (e.g. torch) are never upgraded.
+    are already satisfied (e.g. torch) are never upgraded unless upgrade=True
+    (used when an installed copy is present but broken).
     """
     import importlib
     import subprocess
 
-    missing = []
-    for module, spec in requirements.items():
-        try:
-            importlib.import_module(module)
-        except Exception:
-            missing.append(spec)
+    def broken():
+        result = {}
+        for module, spec in requirements.items():
+            try:
+                importlib.import_module(module)
+            except Exception as error:  # noqa: BLE001 - any failure means reinstall
+                for key in [
+                    k for k in sys.modules if k == module or k.startswith(module + ".")
+                ]:
+                    del sys.modules[key]
+                result[spec] = f"{type(error).__name__}: {error}"
+        return result
+
+    missing = broken()
     if not missing:
         return
-    print(f"[ReaComfy] Installing modules for {purpose}: {' '.join(missing)}")
-    command = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check"]
-    completed = subprocess.run(
-        command + missing, capture_output=True, text=True, timeout=1800
-    )
-    if completed.returncode != 0:
-        tail = (completed.stderr or completed.stdout or "")[-1500:]
-        raise RuntimeError(
-            f"ReaComfy could not install {', '.join(missing)} for {purpose}:\n{tail}"
+    for attempt in ((), ("--upgrade",)) if not upgrade else (("--upgrade",),):
+        print(
+            f"[ReaComfy] Installing modules for {purpose}: {' '.join(missing)}"
+            + (" (upgrade)" if attempt else "")
         )
-    importlib.invalidate_caches()
+        command = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+        ]
+        completed = subprocess.run(
+            command + list(attempt) + list(missing),
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+        if completed.returncode != 0:
+            tail = (completed.stderr or completed.stdout or "")[-1500:]
+            raise RuntimeError(
+                f"ReaComfy could not install {', '.join(missing)} for {purpose}:\n{tail}"
+            )
+        importlib.invalidate_caches()
+        still = broken()
+        if not still:
+            return
+        missing = still
+    details = "\n".join(f"{spec}: {error}" for spec, error in missing.items())
+    raise RuntimeError(
+        f"{purpose}: these modules were installed but still fail to import in "
+        f"ComfyUI's Python ({sys.executable}):\n{details}\nRestart ComfyUI and run "
+        "the node again; if it persists, send this message to the ReaComfy thread."
+    )
 
 
 def _download_github_zip(owner_repo, target, marker):
@@ -2991,7 +3023,16 @@ _DBLM_CACHE = {}
 
 
 DBLM_SE_CODE_ZIP = "https://codeload.github.com/Yorch233/DBLM-SE/zip/refs/heads/main"
-DBLM_SE_DEPS = "einops tabulate accelerate vector-quantize-pytorch transformers pyyaml"
+DBLM_SE_MODULES = {
+    "einops": "einops",
+    "tabulate": "tabulate",
+    "accelerate": "accelerate",
+    "vector_quantize_pytorch": "vector-quantize-pytorch",
+    "transformers": "transformers",
+    "yaml": "pyyaml",
+    "safetensors": "safetensors",
+    "huggingface_hub": "huggingface_hub",
+}
 
 
 def _download_dblm_code(target):
@@ -3139,23 +3180,11 @@ class _IsolatedImport:
         return False
 
 
-def _load_dblm(device):
+def _load_dblm(device, _retry=False):
     cached = _DBLM_CACHE.get(device)
     if cached is not None:
         return cached
-    _ensure_modules(
-        {
-            "einops": "einops",
-            "tabulate": "tabulate",
-            "accelerate": "accelerate",
-            "vector_quantize_pytorch": "vector-quantize-pytorch",
-            "transformers": "transformers",
-            "yaml": "pyyaml",
-            "safetensors": "safetensors",
-            "huggingface_hub": "huggingface_hub",
-        },
-        "DBLM-SE",
-    )
+    _ensure_modules(DBLM_SE_MODULES, "DBLM-SE")
     repo = _dblm_code_dir()
     weights = _hf_snapshot(
         "Yorch233/DBLM-SE-1B", _models_subdir("dblm_se") / "DBLM-SE-1B"
@@ -3208,9 +3237,16 @@ def _load_dblm(device):
                 beta=config.beta, t_max=config.t_max, t_min=0, device=torch_device
             )
     except ImportError as error:
+        top = (error.name or "").split(".")[0]
+        if top in DBLM_SE_MODULES and not _retry:
+            # Present but broken (e.g. a stale copy left by another node):
+            # reinstall it with an upgrade and try once more.
+            _ensure_modules({top: DBLM_SE_MODULES[top]}, "DBLM-SE", upgrade=True)
+            return _load_dblm(device, _retry=True)
         raise RuntimeError(
-            f"DBLM-SE needs an extra module ({error.name}). Install into the ComfyUI "
-            f"environment: python -m pip install {DBLM_SE_DEPS}"
+            f"DBLM-SE could not import its code: {type(error).__name__}: {error}. "
+            "Restart ComfyUI and run the node again; if it persists, send this "
+            "message to the ReaComfy thread."
         ) from error
     _DBLM_CACHE.clear()
     _DBLM_CACHE[device] = (encoder, codec_model, model, sde)

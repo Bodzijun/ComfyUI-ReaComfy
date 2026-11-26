@@ -4,6 +4,10 @@ All notable changes to ReaComfy are documented here.
 
 ## [0.6.0] - 2026-11-26
 
+### Fixed
+
+- DBLM-SE stopped with "needs an extra module (vector_quantize_pytorch)" when the module was present but broken. Missing or broken modules are now reinstalled automatically (with an upgrade on the second try) and checked before the node continues.
+
 ### Added
 
 - `REAPER Nemotron RE-USE (Universal Speech Enhancement)`: NVIDIA's commercial-use RE-USE model (OpenMDW-1.1) for noise, reverb, clipping, codec and bandwidth damage at 8–48 kHz, with `speech` and `removed` outputs, optional bandwidth extension and chunked processing. Runs with `mamba-ssm` on Linux + CUDA or a built-in PyTorch Mamba scan everywhere else.

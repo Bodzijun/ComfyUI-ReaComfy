@@ -382,10 +382,16 @@ def test_ensure_modules_installs_only_missing(nodes, monkeypatch):
         returncode, stdout, stderr = 0, "", ""
 
     monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: calls.append(cmd) or Done())
-    nodes._ensure_modules({"json": "json-pkg", "reacomfy_not_a_module_xyz": "fake-pkg==1"}, "test")
-    assert len(calls) == 1
+    # The fake package never becomes importable: one plain install, one
+    # upgrade retry, then a clear error naming the module.
+    with pytest.raises(RuntimeError, match="fake-pkg==1"):
+        nodes._ensure_modules(
+            {"json": "json-pkg", "reacomfy_not_a_module_xyz": "fake-pkg==1"}, "test"
+        )
+    assert len(calls) == 2
     assert calls[0][:4] == [sys.executable, "-m", "pip", "install"]
     assert calls[0][-1] == "fake-pkg==1" and "json-pkg" not in calls[0]
+    assert "--upgrade" in calls[1] and "--upgrade" not in calls[0]
     calls.clear()
     nodes._ensure_modules({"json": "json-pkg"}, "test")
     assert calls == []
