@@ -2531,6 +2531,1157 @@ class ReaperChordsOnlyToABC:
         return ("\n".join(output),)
 
 
+def _models_subdir(name):
+    """Return ComfyUI/models/<name> (or ~/.cache/reacomfy/<name> outside ComfyUI)."""
+    try:
+        import folder_paths
+
+        base = Path(folder_paths.models_dir) / name
+    except Exception:
+        base = Path.home() / ".cache" / "reacomfy" / name
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _hf_snapshot(repo_id, local_dir, allow_patterns=None):
+    """Download a Hugging Face repo once into local_dir and return its path."""
+    local_dir = Path(local_dir)
+    marker = local_dir / ".reacomfy_complete"
+    if marker.is_file():
+        return local_dir
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as error:
+        raise RuntimeError(
+            "huggingface_hub is required to download model weights. Install it in "
+            "the ComfyUI environment with: python -m pip install huggingface_hub"
+        ) from error
+    snapshot_download(
+        repo_id=repo_id, local_dir=str(local_dir), allow_patterns=allow_patterns
+    )
+    marker.write_text(repo_id, encoding="utf-8")
+    return local_dir
+
+
+def _resolve_device(device):
+    if device and device != "auto":
+        return device
+    if torch.cuda.is_available():
+        return "cuda"
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _interrupt_checker():
+    try:
+        import comfy.model_management as model_management
+
+        return model_management.throw_exception_if_processing_interrupted
+    except Exception:
+        return lambda: None
+
+
+def _resample(waveform, source_rate, target_rate):
+    """Resample [..., T] audio with torchaudio, falling back to linear interpolation."""
+    source_rate, target_rate = int(source_rate), int(target_rate)
+    if source_rate == target_rate:
+        return waveform
+    try:
+        import torchaudio.functional as AF
+
+        return AF.resample(waveform, source_rate, target_rate)
+    except Exception:
+        shape = waveform.shape
+        flat = waveform.reshape(1, -1, shape[-1])
+        size = max(1, round(shape[-1] * target_rate / source_rate))
+        out = torch.nn.functional.interpolate(
+            flat, size=size, mode="linear", align_corners=False
+        )
+        return out.reshape(*shape[:-1], size)
+
+
+def _overlap_chunks(total, chunk, overlap):
+    """Yield (start, end) windows of `chunk` samples that overlap by `overlap`."""
+    if total <= chunk:
+        yield 0, total
+        return
+    hop = max(1, chunk - overlap)
+    start = 0
+    while True:
+        end = min(total, start + chunk)
+        yield start, end
+        if end >= total:
+            return
+        start += hop
+
+
+def _process_in_chunks(signal, sample_rate, chunk_seconds, overlap_seconds, fn):
+    """Run fn on overlapping chunks of a 1-D tensor and crossfade the results."""
+    total = signal.shape[-1]
+    if chunk_seconds <= 0:
+        out = fn(signal)
+        return _fit_length(out, total)
+    chunk = max(1, int(chunk_seconds * sample_rate))
+    overlap = min(int(overlap_seconds * sample_rate), chunk // 2)
+    result = torch.zeros(total, dtype=torch.float32)
+    weight = torch.zeros(total, dtype=torch.float32)
+    check_interrupt = _interrupt_checker()
+    for start, end in _overlap_chunks(total, chunk, overlap):
+        check_interrupt()
+        piece = _fit_length(fn(signal[start:end]), end - start)
+        window = torch.ones(end - start)
+        if overlap > 0:
+            ramp = torch.linspace(0.0, 1.0, overlap + 2)[1:-1]
+            if start > 0:
+                window[:overlap] = ramp[: min(overlap, end - start)]
+            if end < total:
+                n = min(overlap, end - start)
+                window[-n:] = torch.minimum(window[-n:], ramp.flip(0)[-n:])
+        result[start:end] += piece * window
+        weight[start:end] += window
+    return result / weight.clamp_min(1e-6)
+
+
+def _fit_length(samples, length):
+    samples = torch.as_tensor(samples).detach().float().cpu().reshape(-1)
+    if samples.shape[-1] >= length:
+        return samples[:length]
+    return torch.nn.functional.pad(samples, (0, length - samples.shape[-1]))
+
+
+# --------------------------------------------------------------------------
+# DBLM-SE-1B (Yorch233, Apache-2.0): generative denoise + dereverb, 16 kHz.
+# --------------------------------------------------------------------------
+
+_DBLM_CACHE = {}
+
+
+def _dblm_code_dir():
+    candidates = []
+    configured = os.environ.get("DBLM_SE_REPO", "")
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.append(_models_subdir("dblm_se") / "DBLM-SE")
+    candidates.append(Path(__file__).resolve().parent.parent / "DBLM-SE")
+    for candidate in candidates:
+        if (candidate / "src" / "modeling_dblm.py").is_file():
+            return candidate
+    raise RuntimeError(
+        "DBLM-SE code was not found. Clone it once (it is Apache-2.0):\n"
+        f'  git clone https://github.com/Yorch233/DBLM-SE "{candidates[-2]}"\n'
+        "then install its extra modules into the ComfyUI environment WITHOUT its "
+        "pinned torch versions:\n"
+        "  python -m pip install einops tabulate accelerate vector-quantize-pytorch "
+        "torchtune torchao transformers pyyaml\n"
+        "Or set DBLM_SE_REPO to an existing checkout."
+    )
+
+
+class _IsolatedImport:
+    """Import DBLM-SE's generic top-level packages (src, library) without
+    clobbering same-named packages from other custom nodes."""
+
+    NAMES = ("src", "library")
+
+    def __init__(self, repo):
+        self.repo = str(repo)
+
+    def _owned(self):
+        return {
+            key: module
+            for key, module in sys.modules.items()
+            if key.split(".")[0] in self.NAMES
+        }
+
+    def __enter__(self):
+        self.saved = self._owned()
+        for key in self.saved:
+            del sys.modules[key]
+        self.cwd = os.getcwd()
+        os.chdir(self.repo)  # DBLM-SE reads config/models.yaml relative to cwd
+        sys.path.insert(0, self.repo)
+        return self
+
+    def __exit__(self, *exc):
+        os.chdir(self.cwd)
+        try:
+            sys.path.remove(self.repo)
+        except ValueError:
+            pass
+        for key in self._owned():
+            del sys.modules[key]
+        sys.modules.update(self.saved)
+        return False
+
+
+def _load_dblm(device):
+    cached = _DBLM_CACHE.get(device)
+    if cached is not None:
+        return cached
+    repo = _dblm_code_dir()
+    weights = _hf_snapshot(
+        "Yorch233/DBLM-SE-1B", _models_subdir("dblm_se") / "DBLM-SE-1B"
+    )
+    wavlm = sorted((weights / "WavLM").glob("*.pt"))
+    codec = sorted((weights / "Xcodec2").glob("*.safetensors"))
+    if not wavlm or not codec or not (weights / "Wav2vec").is_dir():
+        raise RuntimeError(
+            f"DBLM-SE-1B download looks incomplete in {weights}. Delete the folder "
+            "and run again."
+        )
+    torch_device = torch.device(device)
+    try:
+        with _IsolatedImport(repo):
+            import library  # noqa: F401  registers WavLM and XCodec2
+            from library.register import ModelRegister
+            from safetensors.torch import load_file
+            from src.common.config import read_config_from_yaml
+            from src.modeling_dblm import DBLMForSE
+            from src.sde import DDBM_VPSDE
+
+            config = read_config_from_yaml(str(weights / "config.yml"))
+            encoder = ModelRegister.fetch("WavLM")(
+                model_path=str(wavlm[0]), output_layer=6, device=torch_device
+            )
+            codec_model = ModelRegister.fetch("XCodec2")(
+                model_paths={
+                    "wav2vec": str(weights / "Wav2vec"),
+                    "codec": str(codec[0]),
+                },
+                codec_dim=2048,
+                semantic_dim=1024,
+                device=torch_device,
+            )
+            model = DBLMForSE(
+                in_dim=config.latent_dim,
+                d_model=config.model_dim,
+                nhead=config.num_head,
+                num_layers=config.num_layers,
+            )
+            state = load_file(str(weights / "model.safetensors"))
+            # The checkpoint was saved from a torch.compile wrapper.
+            state = {k.replace("_orig_mod.", "", 1): v for k, v in state.items()}
+            model.load_state_dict(state)
+            model.to(torch_device).eval()
+            sde = DDBM_VPSDE(
+                beta=config.beta, t_max=config.t_max, t_min=0, device=torch_device
+            )
+    except ImportError as error:
+        raise RuntimeError(
+            f"DBLM-SE needs an extra module ({error.name}). Install into the ComfyUI "
+            "environment: python -m pip install einops tabulate accelerate "
+            "vector-quantize-pytorch torchtune torchao transformers pyyaml"
+        ) from error
+    _DBLM_CACHE.clear()
+    _DBLM_CACHE[device] = (encoder, codec_model, model, sde)
+    return _DBLM_CACHE[device]
+
+
+class ReaperDBLMSE:
+    DESCRIPTION = (
+        "Generative speech denoise + dereverb with DBLM-SE-1B (Yorch233, Apache-2.0). "
+        "The model rebuilds speech from WavLM features through an XCodec2 decoder, so "
+        "badly damaged dialogue comes back clean, but the result is resynthesized at "
+        "16 kHz. Chain REAPER ClearVoice Super Resolution or LavaSR after it for 48 kHz. "
+        "Needs the DBLM-SE code checkout and ~11 GB of weights (auto-download); a CUDA "
+        "GPU with about 8 GB or more is recommended."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "steps": (
+                    "INT",
+                    {
+                        "default": 5,
+                        "min": 1,
+                        "max": 30,
+                        "tooltip": "Diffusion-bridge sampling steps. 3-10 is typical; more is slower.",
+                    },
+                ),
+                "strength": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.05,
+                        "tooltip": "1.0 = only the restored voice; lower values mix the (resampled) dry signal back in.",
+                    },
+                ),
+                "output_rate": (
+                    ["original", "16000"],
+                    {
+                        "default": "original",
+                        "tooltip": "original resamples the 16 kHz result back to the input rate (no new highs).",
+                    },
+                ),
+            },
+            "optional": {
+                "chunk_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 12.0,
+                        "min": 0.0,
+                        "max": 60.0,
+                        "step": 1.0,
+                        "tooltip": "Process long files in chunks to bound VRAM. 0 = whole file at once.",
+                    },
+                ),
+                "device": (["auto", "cuda", "cpu"], {"default": "auto"}),
+                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "enhance"
+    CATEGORY = "REAPER AI/Enhancement"
+
+    def enhance(
+        self,
+        audio,
+        steps=5,
+        strength=1.0,
+        output_rate="original",
+        chunk_seconds=12.0,
+        device="auto",
+        keep_model_loaded=True,
+    ):
+        if audio is None or "waveform" not in audio:
+            raise ValueError("REAPER DBLM-SE requires an AUDIO input")
+        waveform = audio["waveform"].detach().float().cpu()
+        sample_rate = int(audio["sample_rate"])
+        if waveform.ndim == 2:
+            waveform = waveform.unsqueeze(0)
+        if waveform.ndim != 3 or waveform.shape[0] != 1:
+            raise ValueError("REAPER DBLM-SE supports one [1,C,T] audio at a time")
+        device = _resolve_device("cpu" if device == "cpu" else device)
+        if device == "mps":
+            device = "cpu"
+        encoder, codec_model, model, sde = _load_dblm(device)
+        torch_device = torch.device(device)
+        mono = _resample(waveform[0].mean(dim=0), sample_rate, 16000)
+        peak = float(mono.abs().max())
+        scale = 1.0 / peak if peak > 0 else 1.0
+
+        def run(chunk):
+            x = (chunk * scale).to(torch_device).reshape(1, 1, -1)
+            with torch.no_grad():
+                latents = encoder(x)
+                solver = sde.get_sde_solver(
+                    model_fn=lambda xt, t: model(
+                        xt,
+                        torch.full(
+                            (xt.shape[0],), t, device=xt.device, dtype=torch.float32
+                        ),
+                        return_logits=False,
+                    )
+                )
+                clean = solver.sampling(x=latents, num_steps=int(steps))
+                tokens = torch.argmax(model.get_logits(clean), dim=1)
+                out = codec_model.token2audio(tokens.unsqueeze(0))
+            return out.float().cpu() / scale
+
+        try:
+            restored = _process_in_chunks(mono, 16000, float(chunk_seconds), 1.0, run)
+        finally:
+            if not keep_model_loaded:
+                _DBLM_CACHE.clear()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        if output_rate == "16000":
+            out_rate = 16000
+            dry = mono
+        else:
+            out_rate = sample_rate
+            restored = _resample(restored, 16000, sample_rate)
+            dry = waveform[0].mean(dim=0)
+        restored = _fit_length(restored, dry.shape[-1])
+        amount = float(strength)
+        mixed = dry + amount * (restored - dry) if amount < 1.0 else restored
+        return ({"waveform": mixed.reshape(1, 1, -1), "sample_rate": out_rate},)
+
+
+# --------------------------------------------------------------------------
+# ZONOS3-Mini (Zyphra; code MIT, weights Apache-2.0): multilingual TTS with
+# voice cloning and steering controls (emotion, pace, accent, texture...).
+# The runtime pins its own Python 3.12 / torch stack, so ReaComfy talks to it
+# out of process: either a running ZONOS3 server (any backend, fastest) or
+# the plain-PyTorch reference in its own venv.
+# --------------------------------------------------------------------------
+
+ZONOS3_LANGUAGES = [
+    "uk", "en_us", "en_gb", "ru", "pl", "cs", "sk", "bg", "ro", "hu", "de",
+    "fr_fr", "es", "it", "pt_br", "nl", "da", "no", "sv", "fi", "el", "tr",
+    "he", "ar", "ka", "hi", "bn", "gu", "kn", "ml", "mr", "or", "pa", "ta",
+    "te", "ur", "id", "ms", "tl", "th", "vi", "ja", "ko", "cmn",
+]  # fmt: skip
+
+# Studio-bundle emotion controls and the doses Zyphra recommends for the
+# release LM ("angry and happy at x2-3, sad at x4-6, calm at x4, scared at x8,
+# confused at x2"). emotion_strength scales these.
+ZONOS3_EMOTIONS = {
+    "none": None,
+    "angry": ("emotions.angry", 2.5),
+    "happy": ("emotions.happy", 2.5),
+    "sad": ("emotions.sad", 5.0),
+    "calm": ("emotions.serene", 4.0),
+    "scared": ("emotions.scared", 8.0),
+    "confused": ("emotions.confused", 2.0),
+}
+
+ZONOS3_ACCENTS = {
+    "none": None,
+    "american": {"accents_en.american": 1.0},
+    "british": {"accents_en.british": 1.0},
+    "scottish": {"accents_en.scottish": 1.0},
+    "irish": {"accents_en.irish": 1.0},
+    "welsh": {"accents_en.welsh": 1.0},
+    "australian": {"accents_en.australian": 1.0},
+    "indian english": {"accents_en.indian": 1.0},
+    "hindi": {"accents_l1.hin": 1.0},
+    "spanish": {"accents_l1.spa": 1.0},
+    "french": {"accents_l1.fra": 1.0},
+    "portuguese": {"accents_l1.por": 1.0},
+    "german": {"accents_l1.deu": 1.0},
+    "vietnamese": {"accents_l1.vie": 1.0},
+    "polish": {"accents_l1.pol": 1.0},
+    "mandarin": {"mandarin.cmn": 1.0, "mandarin_hidden.cmn": 1.0 / 3.0},
+}
+
+# Bipolar studio sliders: (negative direction, positive direction).
+ZONOS3_BIPOLAR = {
+    "gender": ({"identity.gender": -1}, {"identity.gender": 1}),
+    "age": ({"identity.age": -1}, {"identity.age": 1}),
+    "pitch": ({"pitch.pitch": -1}, {"pitch.pitch": 1}),
+    "intonation": ({"pitch.pitch_range": -1}, {"pitch.pitch_range": 1}),
+    "room": ({"room.clean": -1}, {"room.clean": 1}),
+    "projection": ({"delivery.whisper": 1}, {"delivery.loud": 1}),
+    "pace": ({"delivery.tempo": -1}, {"delivery.tempo": 1}),
+    "chatty": ({"delivery.conversational": -1}, {"delivery.conversational": 1}),
+    "liveliness": ({"expressive.expressive": -1}, {"expressive.expressive": 1}),
+    "hesitation": ({"disfluency.disfluent": -1}, {"disfluency.disfluent": 1}),
+    "valence": ({"mood.valence": -1}, {"mood.valence": 1}),
+    "arousal": ({"mood.arousal": -1}, {"mood.arousal": 1}),
+}
+
+ZONOS3_TEXTURE = {
+    "deep": "texture.deep",
+    "bright": "texture.shrill",
+    "husky": "texture.husky",
+    "raspy": "texture.raspy",
+    "soft": "texture.soft",
+    "authority": "texture.authoritative",
+}
+
+ZONOS3_PRESETS = {
+    "none": {},
+    "BBC newsreader": {"accent": ("british", 1.5), "authority": 3, "room": 2},
+    "Elderly Scottish narrator": {
+        "age": 1.5,
+        "accent": ("scottish", 1.5),
+        "deep": 2,
+        "intonation": -1,
+    },
+    "Gravelly old man": {"gender": -1, "age": 2, "raspy": 3, "deep": 2},
+    "Chatty podcaster": {"chatty": 3, "room": 1, "liveliness": 4},
+    "Late-night radio": {"deep": 2, "room": 3, "pace": -0.8, "projection": -0.6},
+    "Phone call": {"room": -2},
+}
+
+ZONOS3_LM = "hf://Zyphra/ZONOS3-Mini/lm/zonos3_mini"
+ZONOS3_BUNDLE = "assets/steering/studio_bundle_mect60k_x10.json"
+
+
+def zonos3_controls(
+    sliders=None, texture=None, emotion="none", emotion_strength=1.0,
+    accent="none", accent_strength=1.0, preset="none", extra=None,
+):  # fmt: skip
+    """Translate ReaComfy sliders into ZONOS3 raw steering doses."""
+    sliders = dict(sliders or {})
+    texture = dict(texture or {})
+    preset_values = dict(ZONOS3_PRESETS.get(preset, {}))
+    preset_accent = preset_values.pop("accent", None)
+    for key, value in preset_values.items():
+        if key in ZONOS3_TEXTURE:
+            texture[key] = texture.get(key, 0.0) or value
+        else:
+            sliders[key] = sliders.get(key, 0.0) or value
+    controls = {}
+
+    def add(mapping, dose):
+        for direction, weight in mapping.items():
+            controls[direction] = controls.get(direction, 0.0) + weight * dose
+
+    for key, value in sliders.items():
+        value = float(value or 0.0)
+        if value == 0.0 or key not in ZONOS3_BIPOLAR:
+            continue
+        negative, positive = ZONOS3_BIPOLAR[key]
+        add(positive if value > 0 else negative, abs(value))
+    for key, value in texture.items():
+        value = float(value or 0.0)
+        if value > 0.0 and key in ZONOS3_TEXTURE:
+            add({ZONOS3_TEXTURE[key]: 1.0}, value)
+    if emotion in ZONOS3_EMOTIONS and ZONOS3_EMOTIONS[emotion] is not None:
+        direction, dose = ZONOS3_EMOTIONS[emotion]
+        if float(emotion_strength) > 0:
+            add({direction: 1.0}, dose * float(emotion_strength))
+    if accent == "none" and preset_accent:
+        accent, accent_strength = preset_accent
+    if ZONOS3_ACCENTS.get(accent) and float(accent_strength) > 0:
+        add(ZONOS3_ACCENTS[accent], float(accent_strength))
+    for direction, dose in (extra or {}).items():
+        add({str(direction): 1.0}, float(dose))
+    return {k: round(v, 4) for k, v in controls.items() if abs(v) > 1e-6}
+
+
+def zonos3_split_text(text, mode):
+    text = str(text or "").strip()
+    if not text:
+        return []
+    if mode == "whole text":
+        return [text]
+    if mode == "paragraphs":
+        parts = [p.strip() for p in text.replace("\r\n", "\n").split("\n\n")]
+    else:  # lines
+        parts = [p.strip() for p in text.replace("\r\n", "\n").split("\n")]
+    return [p for p in parts if p]
+
+
+def _zonos3_server_generate(url, request, token, timeout):
+    import urllib.error
+    import urllib.request
+
+    body = dict(request, stream=False, format="wav")
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url.rstrip("/") + "/v2/generate",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            payload = response.read()
+            seed = response.headers.get("X-Seed")
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", "replace")[:800]
+        raise RuntimeError(f"ZONOS3 server error {error.code}: {detail}") from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(
+            f"Cannot reach the ZONOS3 server at {url} ({error.reason}). Start it first "
+            "(see README: ZONOS3-Mini), or switch backend to 'reference (venv)'."
+        ) from error
+    import io
+
+    samples, rate = sf.read(io.BytesIO(payload), dtype="float32", always_2d=True)
+    return torch.from_numpy(samples.mean(axis=1)), int(rate), seed
+
+
+def _zonos3_reference_generate(python, home, request, device, dtype, timeout):
+    import subprocess
+    import tempfile
+
+    python = python or os.environ.get("ZONOS3_PYTHON", "")
+    home = home or os.environ.get("ZONOS3_HOME", "")
+    if not python or not home:
+        raise RuntimeError(
+            "The 'reference (venv)' backend needs the ZONOS3 checkout and its Python: "
+            "set zonos3_home / zonos3_python on the node, or the ZONOS3_HOME and "
+            "ZONOS3_PYTHON environment variables (see README: ZONOS3-Mini)."
+        )
+    workdir = Path(tempfile.mkdtemp(prefix="reacomfy_zonos3_"))
+    try:
+        request_file = workdir / "request.json"
+        output = workdir / "out.wav"
+        request_file.write_text(json.dumps(request), encoding="utf-8")
+        command = [
+            python, "-m", "zonos3.reference", "--model", ZONOS3_LM,
+            "--request", str(request_file), "-o", str(output),
+            "--dtype", dtype,
+        ]  # fmt: skip
+        if device != "auto":
+            command += ["--device", device]
+        bundle = Path(home) / ZONOS3_BUNDLE
+        if request.get("controls") and bundle.is_file():
+            command += ["--steer-bundle", str(bundle)]
+        completed = subprocess.run(
+            command, cwd=home, capture_output=True, text=True, timeout=timeout
+        )
+        if completed.returncode != 0 or not output.is_file():
+            tail = (completed.stderr or completed.stdout or "")[-1500:]
+            raise RuntimeError(f"ZONOS3 reference failed:\n{tail}")
+        samples, rate = sf.read(str(output), dtype="float32", always_2d=True)
+        seed = None
+        for token in (completed.stdout or "").split(","):
+            if token.strip().startswith("seed "):
+                seed = token.strip()[5:]
+        return torch.from_numpy(samples.mean(axis=1)), int(rate), seed
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+class ReaperZonos3TTS:
+    DESCRIPTION = (
+        "ZONOS3-Mini text-to-speech (Zyphra; code MIT, weights Apache-2.0, 43 languages "
+        "incl. Ukrainian). Clones the voice of the optional reference AUDIO (5-30 s of "
+        "clean speech, e.g. the selected REAPER item) and steers emotion, pace, "
+        "projection, accent, texture and room. Runs out of process: a ZONOS3 server "
+        "(fast) or the reference in its own Python venv. Output: 44.1 kHz mono."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        def bipolar(lo, hi, tip):
+            return (
+                "FLOAT",
+                {"default": 0.0, "min": lo, "max": hi, "step": 0.1, "tooltip": tip},
+            )
+
+        def unipolar(hi, tip):
+            return (
+                "FLOAT",
+                {"default": 0.0, "min": 0.0, "max": hi, "step": 0.1, "tooltip": tip},
+            )
+
+        return {
+            "required": {
+                "text": (
+                    "STRING",
+                    {"multiline": True, "default": "Привіт! Це тест голосу ZONOS3."},
+                ),
+                "language": (ZONOS3_LANGUAGES, {"default": "uk"}),
+                "backend": (
+                    ["server", "reference (venv)"],
+                    {
+                        "default": "server",
+                        "tooltip": "server: a running ZONOS3 server (model stays loaded). reference: one-off run of zonos3.reference in its own venv (reloads the model each time).",
+                    },
+                ),
+                "emotion": (list(ZONOS3_EMOTIONS), {"default": "none"}),
+                "emotion_strength": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 2.0,
+                        "step": 0.05,
+                        "tooltip": "1.0 = Zyphra's recommended dose for the chosen emotion.",
+                    },
+                ),
+                "pace": bipolar(-2, 2, "slower <-> faster (-1 = x1.45 longer)."),
+                "projection": bipolar(-1.5, 2, "whisper <-> loud."),
+                "valence": bipolar(-4, 4, "Mood: negative <-> positive."),
+                "arousal": bipolar(-4, 4, "Mood: calm <-> excited."),
+                "accent": (list(ZONOS3_ACCENTS), {"default": "none"}),
+                "accent_strength": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05},
+                ),
+                "seed": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 4294967295,
+                        "tooltip": "0 = random. Keep a seed to get the same take again.",
+                    },
+                ),
+            },
+            "optional": {
+                "reference_audio": ("AUDIO",),
+                "speaker_id": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Server backend: a voice id from GET /v2/speakers, used when no reference_audio is connected.",
+                    },
+                ),
+                "preset": (list(ZONOS3_PRESETS), {"default": "none"}),
+                "chatty": bipolar(-4, 4, "careful reading <-> spontaneous."),
+                "liveliness": bipolar(-8, 8, "flat <-> lively intonation."),
+                "hesitation": bipolar(-8, 8, "fluent <-> hesitant."),
+                "gender": bipolar(-2, 2, "masculine <-> feminine (changes the voice)."),
+                "age": bipolar(-2, 2, "younger <-> older."),
+                "pitch": bipolar(-2, 2, "lower <-> higher."),
+                "intonation": bipolar(-2, 2, "monotone <-> varied."),
+                "room": bipolar(-2, 4, "phone <-> studio."),
+                "deep": unipolar(4, "Deeper, huskier."),
+                "bright": unipolar(4, "Shriller."),
+                "husky": unipolar(4, "Huskier."),
+                "raspy": unipolar(4, "Raspy (changes the voice the most)."),
+                "soft": unipolar(4, "Softer and quieter."),
+                "authority": unipolar(4, "More authoritative."),
+                "extra_controls": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "tooltip": 'Advanced: JSON of raw bundle doses, e.g. {"emotions.relieved": 3}.',
+                    },
+                ),
+                "split": (
+                    ["lines", "paragraphs", "whole text"],
+                    {
+                        "default": "lines",
+                        "tooltip": "Generate each line/paragraph separately (stable on long scripts) and join them.",
+                    },
+                ),
+                "gap_ms": ("INT", {"default": 350, "min": 0, "max": 5000, "step": 50}),
+                "temperature": (
+                    "FLOAT",
+                    {"default": 0.75, "min": 0.1, "max": 1.5, "step": 0.05},
+                ),
+                "speaker_cfg_scale": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 1.0,
+                        "max": 3.0,
+                        "step": 0.1,
+                        "tooltip": "Closer to the reference voice (>1 doubles compute). Cannot be combined with laci.",
+                    },
+                ),
+                "laci": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Alignment-guarded decoding: fewer skipped/repeated words (server needs LACI heads).",
+                    },
+                ),
+                "server_url": ("STRING", {"default": "http://127.0.0.1:1919"}),
+                "access_token": ("STRING", {"default": ""}),
+                "zonos3_home": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Reference backend: ZONOS3 checkout (or env ZONOS3_HOME).",
+                    },
+                ),
+                "zonos3_python": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Reference backend: python of the ZONOS3 venv (or env ZONOS3_PYTHON).",
+                    },
+                ),
+                "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
+                "timeout_s": ("INT", {"default": 900, "min": 30, "max": 7200}),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO", "STRING")
+    RETURN_NAMES = ("audio", "info")
+    FUNCTION = "speak"
+    CATEGORY = "REAPER AI/Voice"
+
+    def build_request(self, text, language, controls, seed, kwargs, speaker):
+        request = {
+            "text": text,
+            "language": language,
+            "temperature": float(kwargs.get("temperature", 0.75)),
+        }
+        if int(seed) > 0:
+            request["seed"] = int(seed)
+        request.update(speaker)
+        if controls:
+            request["controls"] = controls
+            request["speaker_mode"] = "embedding"
+        cfg = float(kwargs.get("speaker_cfg_scale", 1.0))
+        if kwargs.get("laci"):
+            request["laci"] = True
+        elif cfg > 1.0:
+            request["speaker_cfg_scale"] = cfg
+        return request
+
+    def speak(
+        self,
+        text,
+        language="uk",
+        backend="server",
+        emotion="none",
+        emotion_strength=1.0,
+        pace=0.0,
+        projection=0.0,
+        valence=0.0,
+        arousal=0.0,
+        accent="none",
+        accent_strength=1.0,
+        seed=0,
+        reference_audio=None,
+        speaker_id="",
+        preset="none",
+        extra_controls="",
+        split="lines",
+        gap_ms=350,
+        server_url="http://127.0.0.1:1919",
+        access_token="",
+        zonos3_home="",
+        zonos3_python="",
+        device="auto",
+        timeout_s=900,
+        **kwargs,
+    ):
+        import base64
+        import io
+
+        parts = zonos3_split_text(text, split)
+        if not parts:
+            raise ValueError("REAPER ZONOS3 TTS: text is empty")
+        sliders = {
+            "pace": pace,
+            "projection": projection,
+            "valence": valence,
+            "arousal": arousal,
+        }
+        for key in ZONOS3_BIPOLAR:
+            if key in kwargs:
+                sliders[key] = kwargs[key]
+        texture = {key: kwargs.get(key, 0.0) for key in ZONOS3_TEXTURE}
+        extra = {}
+        if str(extra_controls or "").strip():
+            try:
+                extra = json.loads(extra_controls)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"extra_controls is not valid JSON: {error}"
+                ) from error
+            if not isinstance(extra, dict):
+                raise ValueError(
+                    'extra_controls must be a JSON object like {"emotions.relieved": 3}'
+                )
+        controls = zonos3_controls(
+            sliders, texture, emotion, emotion_strength, accent, accent_strength,
+            preset, extra,
+        )  # fmt: skip
+
+        speaker = {}
+        if reference_audio is not None and "waveform" in reference_audio:
+            ref = reference_audio["waveform"].detach().float().cpu()
+            ref = ref.reshape(-1, ref.shape[-1]).mean(dim=0)
+            ref_rate = int(reference_audio["sample_rate"])
+            ref = ref[: ref_rate * 60]  # the speaker encoder reads up to 60 s
+            buffer = io.BytesIO()
+            sf.write(buffer, ref.numpy(), ref_rate, format="WAV", subtype="PCM_16")
+            speaker["speaker_audio_base64"] = base64.b64encode(
+                buffer.getvalue()
+            ).decode("ascii")
+            speaker["speaker_audio_name"] = "reaper_reference.wav"
+        elif str(speaker_id or "").strip():
+            speaker["speaker_embedding_id"] = str(speaker_id).strip()
+
+        check_interrupt = _interrupt_checker()
+        pieces, rate, seeds = [], 44100, []
+        dtype = "bf16" if _resolve_device(device) == "cuda" else "f32"
+        for part in parts:
+            check_interrupt()
+            request = self.build_request(
+                part, language, controls, seed, kwargs, speaker
+            )
+            if backend == "server":
+                samples, rate, used_seed = _zonos3_server_generate(
+                    server_url, request, access_token, int(timeout_s)
+                )
+            else:
+                samples, rate, used_seed = _zonos3_reference_generate(
+                    zonos3_python, zonos3_home, request, device, dtype, int(timeout_s)
+                )
+            seeds.append(str(used_seed))
+            if pieces and int(gap_ms) > 0:
+                pieces.append(torch.zeros(int(rate * int(gap_ms) / 1000)))
+            pieces.append(samples)
+        audio_out = torch.cat(pieces).reshape(1, 1, -1)
+        info = json.dumps(
+            {
+                "language": language,
+                "segments": len(parts),
+                "seeds": seeds,
+                "controls": controls,
+                "voice": "reference"
+                if "speaker_audio_base64" in speaker
+                else (speaker_id or "default"),
+            },
+            ensure_ascii=False,
+        )
+        return ({"waveform": audio_out, "sample_rate": rate}, info)
+
+
+# --------------------------------------------------------------------------
+# NVIDIA Nemotron RE-USE (OpenMDW-1.1, commercial use allowed): universal
+# speech enhancement (noise, reverb, clipping, codec, bandwidth) at 8-48 kHz.
+# The research variants nvidia/RE-USE and Real-time_RE-USE are non-commercial
+# and deliberately not offered here.
+# --------------------------------------------------------------------------
+
+REUSE_REPO = "nvidia/NVIDIA-NemotronLabs-RE-USE"
+_REUSE_CACHE = {}
+
+
+class _MambaFallback(torch.nn.Module):
+    """Pure-PyTorch Mamba (v1) with mamba_ssm's parameter names.
+
+    Used when the CUDA-only mamba_ssm package is missing (Windows, macOS, CPU).
+    Numerically the same selective scan as mamba_ssm's reference path, just
+    slower; the checkpoint loads unchanged.
+    """
+
+    def __init__(
+        self, d_model, d_state=16, d_conv=4, expand=2, dt_rank="auto",
+        conv_bias=True, bias=False, **_ignored,
+    ):  # fmt: skip
+        super().__init__()
+        import math
+
+        self.d_inner = int(expand * d_model)
+        self.d_state = d_state
+        self.dt_rank = math.ceil(d_model / 16) if dt_rank == "auto" else dt_rank
+        self.in_proj = torch.nn.Linear(d_model, self.d_inner * 2, bias=bias)
+        self.conv1d = torch.nn.Conv1d(
+            self.d_inner, self.d_inner, kernel_size=d_conv, groups=self.d_inner,
+            padding=d_conv - 1, bias=conv_bias,
+        )  # fmt: skip
+        self.x_proj = torch.nn.Linear(
+            self.d_inner, self.dt_rank + d_state * 2, bias=False
+        )
+        self.dt_proj = torch.nn.Linear(self.dt_rank, self.d_inner, bias=True)
+        a = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
+        self.A_log = torch.nn.Parameter(torch.log(a))
+        self.D = torch.nn.Parameter(torch.ones(self.d_inner))
+        self.out_proj = torch.nn.Linear(self.d_inner, d_model, bias=bias)
+
+    def forward(self, hidden_states):
+        batch, length, _ = hidden_states.shape
+        x, z = self.in_proj(hidden_states).chunk(2, dim=-1)
+        x = self.conv1d(x.transpose(1, 2))[..., :length].transpose(1, 2)
+        x = torch.nn.functional.silu(x)
+        dt, b, c = torch.split(
+            self.x_proj(x), [self.dt_rank, self.d_state, self.d_state], dim=-1
+        )
+        dt = torch.nn.functional.softplus(self.dt_proj(dt))  # [B, L, D]
+        a = -torch.exp(self.A_log.float())  # [D, N]
+        y = self._scan(x.float(), dt.float(), a, b.float(), c.float())
+        y = y + x.float() * self.D.float()
+        y = y.to(hidden_states.dtype) * torch.nn.functional.silu(z)
+        return self.out_proj(y)
+
+    @staticmethod
+    def _scan(x, dt, a, b, c):
+        """Exact selective scan, one step at a time (stable for any decay)."""
+        batch, length, dim = x.shape
+        state = x.new_zeros(batch, dim, a.shape[-1])
+        outputs = []
+        for t in range(length):
+            dt_t = dt[:, t, :, None]
+            state = (
+                torch.exp(dt_t * a) * state + dt_t * b[:, t, None, :] * x[:, t, :, None]
+            )
+            outputs.append((state * c[:, t, None, :]).sum(-1))
+        return torch.stack(outputs, dim=1)
+
+
+def _reuse_files():
+    root = _hf_snapshot(REUSE_REPO, _models_subdir("nemotron_reuse") / "RE-USE")
+    recipes = sorted((root / "recipes").glob("*.yaml"))
+    if not (root / "models").is_dir() or not recipes:
+        raise RuntimeError(
+            f"RE-USE download looks incomplete in {root}. Delete the folder and run again."
+        )
+    return root, recipes[0]
+
+
+def _load_reuse(device, backend):
+    key = (device, backend)
+    if key in _REUSE_CACHE:
+        return _REUSE_CACHE[key]
+    import types
+
+    import yaml
+    from safetensors.torch import load_file
+
+    root, recipe = _reuse_files()
+    cfg = yaml.safe_load(recipe.read_text(encoding="utf-8"))
+    use_native = backend == "mamba_ssm" or (backend == "auto" and device == "cuda")
+    native = None
+    if use_native:
+        try:
+            import mamba_ssm as native
+        except Exception:
+            if backend == "mamba_ssm":
+                raise RuntimeError(
+                    "mamba_ssm is not installed (Linux + CUDA only). Use mamba backend "
+                    "'pytorch' or install it: python -m pip install mamba-ssm"
+                )
+            native = None
+    shim = native or types.SimpleNamespace(Mamba=_MambaFallback)
+    importer = _IsolatedImport(root)
+    importer.NAMES = ("models", "utils", "mamba_ssm")
+    with importer:
+        sys.modules["mamba_ssm"] = shim
+        from models.generator_SEMamba_time_d4 import SEMamba
+        from models.stfts import mag_phase_istft, mag_phase_stft
+
+        model = SEMamba(cfg)
+    state = load_file(str(root / "model.safetensors"))
+    model.load_state_dict(state)
+    model.to(torch.device(device)).eval()
+    entry = (model, cfg, mag_phase_stft, mag_phase_istft, native is not None)
+    _REUSE_CACHE.clear()
+    _REUSE_CACHE[key] = entry
+    return entry
+
+
+def _make_even(value):
+    value = int(round(value))
+    return value if value % 2 == 0 else value + 1
+
+
+class ReaperNemotronReUSE:
+    DESCRIPTION = (
+        "NVIDIA Nemotron RE-USE universal speech enhancement (OpenMDW-1.1, commercial "
+        "use allowed): removes noise and reverb, repairs clipping, codec and packet-loss "
+        "damage at the source rate (8-48 kHz), keeps the main speaker. Optional bandwidth "
+        "extension. 9.6M params; weights (~40 MB) download on first use. Uses mamba_ssm on "
+        "Linux+CUDA, otherwise a slower built-in PyTorch path (fine on a GPU, very slow on CPU)."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "strength": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.05,
+                        "tooltip": "1.0 = fully enhanced; lower values blend the dry signal back in.",
+                    },
+                ),
+                "bandwidth_extension": (
+                    ["off", "32000", "44100", "48000"],
+                    {
+                        "default": "off",
+                        "tooltip": "Resample to this rate first so the model regenerates the missing highs (e.g. 8/16 kHz phone or Zoom audio).",
+                    },
+                ),
+                "channels": (
+                    ["per channel", "mono"],
+                    {"default": "per channel"},
+                ),
+            },
+            "optional": {
+                "chunk_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 5.0,
+                        "min": 0.0,
+                        "max": 60.0,
+                        "step": 0.5,
+                        "tooltip": "NVIDIA's long-file recipe uses 5 s chunks with 50% overlap. 0 = whole file.",
+                    },
+                ),
+                "mamba_backend": (
+                    ["auto", "mamba_ssm", "pytorch"],
+                    {
+                        "default": "auto",
+                        "tooltip": "auto uses mamba_ssm when it is installed on CUDA, otherwise the portable PyTorch scan.",
+                    },
+                ),
+                "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
+                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO", "AUDIO")
+    RETURN_NAMES = ("speech", "removed")
+    FUNCTION = "enhance"
+    CATEGORY = "REAPER AI/Enhancement"
+
+    def enhance(
+        self,
+        audio,
+        strength=1.0,
+        bandwidth_extension="off",
+        channels="per channel",
+        chunk_seconds=5.0,
+        mamba_backend="auto",
+        device="auto",
+        keep_model_loaded=True,
+    ):
+        if audio is None or "waveform" not in audio:
+            raise ValueError("REAPER Nemotron RE-USE requires an AUDIO input")
+        waveform = audio["waveform"].detach().float().cpu()
+        sample_rate = int(audio["sample_rate"])
+        if waveform.ndim == 2:
+            waveform = waveform.unsqueeze(0)
+        if waveform.ndim != 3:
+            raise ValueError("Audio waveform must be [B,C,T]")
+        device = _resolve_device(device)
+        model, cfg, stft, istft, _native = _load_reuse(device, mamba_backend)
+        torch_device = torch.device(device)
+
+        work_rate = sample_rate
+        if bandwidth_extension != "off":
+            work_rate = int(bandwidth_extension)
+        work_rate = min(max(work_rate, 8000), 48000)
+        dry = waveform.mean(dim=1, keepdim=True) if channels == "mono" else waveform
+        dry = _resample(dry, sample_rate, work_rate)
+
+        stft_cfg = cfg["stft_cfg"]
+        base = stft_cfg["sampling_rate"]
+        n_fft = _make_even(stft_cfg["n_fft"] * work_rate // base)
+        hop = _make_even(stft_cfg["hop_size"] * work_rate // base)
+        win = _make_even(stft_cfg["win_size"] * work_rate // base)
+        compress = cfg["model_cfg"]["compress_factor"]
+
+        def run(chunk):
+            x = chunk.to(torch_device).reshape(1, -1)
+            with torch.no_grad():
+                mag, pha, _ = stft(
+                    x, n_fft=n_fft, hop_size=hop, win_size=win,
+                    compress_factor=compress, center=True, addeps=False,
+                )  # fmt: skip
+                amp, phase, _ = model(mag, pha)
+                # NVIDIA's fix for the "strange sweep artifact": silence frames
+                # whose decoded magnitude is mostly zero.
+                linear = torch.expm1(torch.relu(amp))
+                zero_portion = (linear == 0).sum(1) / linear.shape[1]
+                amp[:, :, (zero_portion > 0.5)[0]] = 0
+                out = istft(amp, phase, n_fft, hop, win, compress)
+            return out.float().cpu()
+
+        wet = torch.empty_like(dry)
+        try:
+            for b in range(dry.shape[0]):
+                for c in range(dry.shape[1]):
+                    wet[b, c] = _process_in_chunks(
+                        dry[b, c], work_rate, float(chunk_seconds),
+                        float(chunk_seconds) * 0.5, run,
+                    )  # fmt: skip
+        finally:
+            if not keep_model_loaded:
+                _REUSE_CACHE.clear()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        amount = float(strength)
+        speech = dry + amount * (wet - dry) if amount < 1.0 else wet
+        removed = dry - speech
+        return (
+            {"waveform": speech.contiguous(), "sample_rate": work_rate},
+            {"waveform": removed.contiguous(), "sample_rate": work_rate},
+        )
+
+
 NODE_CLASS_MAPPINGS = {
     "REAPERInput": ReaperInput,
     "REAPERReferenceInput": ReaperReferenceInput,
@@ -2553,6 +3704,9 @@ NODE_CLASS_MAPPINGS = {
     "REAPERTextOutput": ReaperTextOutput,
     "REAPERChordsToABC": ReaperChordsToABC,
     "REAPERChordsOnlyToABC": ReaperChordsOnlyToABC,
+    "REAPERNemotronReUSE": ReaperNemotronReUSE,
+    "REAPERZonos3TTS": ReaperZonos3TTS,
+    "REAPERDBLMSE": ReaperDBLMSE,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "REAPERInput": "REAPER Input",
@@ -2576,4 +3730,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "REAPERTextOutput": "REAPER Text Output (SRT / Notes / Markers)",
     "REAPERChordsToABC": "REAPER Chords → ABC",
     "REAPERChordsOnlyToABC": "REAPER Chords → ABC (Chord-only)",
+    "REAPERNemotronReUSE": "REAPER Nemotron RE-USE (Universal Speech Enhancement)",
+    "REAPERZonos3TTS": "REAPER ZONOS3 TTS (Voice Clone + Emotion/Accent)",
+    "REAPERDBLMSE": "REAPER DBLM-SE (Generative Denoise + Dereverb)",
 }

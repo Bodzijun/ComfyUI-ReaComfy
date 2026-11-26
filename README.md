@@ -1,4 +1,4 @@
-# ComfyUI-ReaComfy — REAPER Bridge nodes (ReaComfy 0.5.3)
+# ComfyUI-ReaComfy — REAPER Bridge nodes (ReaComfy 0.6.0)
 
 ComfyUI custom nodes that exchange audio, MIDI, text and video with the active
 REAPER project. They are the ComfyUI half of
@@ -109,6 +109,101 @@ synthesizes a new upper band and outputs 48 kHz. It does not preserve the
 original high-frequency samples. Use `MossFormer2_SR_48K` instead when the
 source already contains valuable full-band information. Project:
 https://github.com/ysharma3501/LavaSR
+
+### NVIDIA Nemotron RE-USE
+
+`REAPER Nemotron RE-USE (Universal Speech Enhancement)` uses
+[nvidia/NVIDIA-NemotronLabs-RE-USE](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-RE-USE)
+(OpenMDW-1.1, "ready for commercial use"). One small model (9.6M parameters)
+removes noise and reverb and repairs clipping, codec and packet-loss damage at
+the source rate (8–48 kHz) while keeping the main speaker. The research
+variants `nvidia/RE-USE` and `nvidia/Real-time_RE-USE` are non-commercial and
+are not used here.
+
+The code and weights (~40 MB) download on first use into
+`ComfyUI/models/nemotron_reuse/`. Extra modules (most ComfyUI installs already
+have them):
+
+```bash
+python -m pip install huggingface_hub einops pyyaml safetensors
+# optional, Linux + CUDA only, faster:
+python -m pip install mamba-ssm
+```
+
+Without `mamba-ssm` (Windows, macOS, CPU) the node uses a built-in PyTorch
+version of the Mamba scan: same weights and maths, slower. On an NVIDIA GPU
+without `mamba-ssm` (e.g. Windows) expect several seconds per 5 s chunk; on
+CPU it takes minutes per chunk, so use it only for short clips.
+`mamba_backend` forces either path.
+
+- `strength` — 1.0 = fully enhanced; lower values blend the dry signal back in.
+- `bandwidth_extension` — resample to 32/44.1/48 kHz first so the model
+  regenerates the missing highs of phone/Zoom/16 kHz recordings.
+- `chunk_seconds` — NVIDIA's long-file recipe (5 s, 50 % overlap).
+- Outputs `speech` and `removed` (speech + removed = input).
+
+### ZONOS3-Mini TTS
+
+`REAPER ZONOS3 TTS (Voice Clone + Emotion/Accent)` speaks text with
+[Zyphra ZONOS3-Mini](https://huggingface.co/Zyphra/ZONOS3-Mini) (code MIT,
+weights Apache-2.0, 43 languages including Ukrainian and Russian). Connect a
+`reference_audio` (5–30 s of clean speech, for example the selected REAPER
+item) to clone that voice, or give a `speaker_id` from the server's default
+voices.
+
+Controls (Zyphra's studio steering bundle): emotion (angry, happy, sad, calm,
+scared, confused) with a strength where 1.0 is Zyphra's recommended dose; pace;
+projection (whisper ↔ loud); mood valence and arousal; read ↔ chatty; flat ↔
+lively; hesitation; accent (British, American, Scottish, Irish, Welsh,
+Australian, Indian English, Hindi, Spanish, French, Portuguese, German,
+Vietnamese, Polish, Mandarin) with strength; gender, age, pitch, intonation,
+room (phone ↔ studio); texture (deep, bright, husky, raspy, soft, authority);
+character presets; and `extra_controls` for raw bundle doses as JSON. Each line
+of the text is generated separately (`split`) and joined with `gap_ms` of
+silence. Output is 44.1 kHz mono; `info` returns the seeds used.
+
+ZONOS3 pins its own Python 3.12 / PyTorch stack, so the node does not install
+it into ComfyUI. It talks to ZONOS3 in one of two ways:
+
+1. **`server` (recommended):** run a ZONOS3 server and keep it open; the model
+   stays loaded. From a checkout of https://github.com/Zyphra/ZONOS3:
+   - Linux + NVIDIA: `uv sync --locked --all-packages`, then
+     `servers/sgl/scripts/serve.sh`;
+   - Apple Silicon: `uv sync --locked --package zonos3-mlx`, download the GGUF
+     files and run `servers/mlx/scripts/serve.sh`;
+   - Windows / CPU / Vulkan: build the C++ server in `servers/ggml`
+     (see its README) and start `zonos3-server`.
+   The default URL is `http://127.0.0.1:1919`.
+2. **`reference (venv)`:** runs `python -m zonos3.reference` from the ZONOS3
+   checkout for each line (reloads the model every time, slower). Set
+   `zonos3_home` / `zonos3_python` on the node or the `ZONOS3_HOME` /
+   `ZONOS3_PYTHON` environment variables.
+
+Steering controls need the steering bundle: the sgl server loads it by default;
+the GGUF servers need `gguf/steer.gguf` next to the backbone.
+
+### DBLM-SE-1B
+
+`REAPER DBLM-SE (Generative Denoise + Dereverb)` uses
+[Yorch233/DBLM-SE-1B](https://huggingface.co/Yorch233/DBLM-SE-1B) (Apache-2.0).
+It rebuilds speech from WavLM features through an XCodec2 decoder, so badly
+damaged, noisy and reverberant dialogue comes back clean. The result is
+resynthesized at **16 kHz**: chain `REAPER ClearVoice Super Resolution` or
+`REAPER LavaSR v2` after it for full band. A CUDA GPU with about 8 GB or more
+is recommended.
+
+Install once (do **not** use DBLM-SE's own `requirements.txt`: it pins an old
+PyTorch that would break ComfyUI):
+
+```bash
+git clone https://github.com/Yorch233/DBLM-SE ComfyUI/models/dblm_se/DBLM-SE
+python -m pip install einops tabulate accelerate vector-quantize-pytorch torchtune torchao transformers pyyaml huggingface_hub
+```
+
+`DBLM_SE_REPO` can point to another checkout. The weights (~11 GB: model,
+WavLM-Large, w2v-BERT and XCodec2) download on first use into
+`ComfyUI/models/dblm_se/DBLM-SE-1B/`. `steps` sets the sampling steps (3–10 is
+typical), `chunk_seconds` bounds VRAM on long files.
 
 ### DeepFilterNet / Egregora
 
