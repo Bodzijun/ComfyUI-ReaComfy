@@ -3602,10 +3602,10 @@ class ReaperDBLMSE:
                 "steps": (
                     "INT",
                     {
-                        "default": 5,
+                        "default": 3,
                         "min": 1,
                         "max": 30,
-                        "tooltip": "Diffusion-bridge sampling steps. 3-10 is typical; more is slower.",
+                        "tooltip": "Diffusion-bridge sampling steps. The authors use 3; more is slower and not always cleaner.",
                     },
                 ),
                 "strength": (
@@ -3615,7 +3615,7 @@ class ReaperDBLMSE:
                         "min": 0.0,
                         "max": 1.0,
                         "step": 0.05,
-                        "tooltip": "1.0 = only the restored voice; lower values mix the (resampled) dry signal back in.",
+                        "tooltip": "1.0 = only the restored voice. The voice is resynthesized, so its phase never matches the original: values below 1.0 comb-filter and smear. Keep 1.0 unless you want that.",
                     },
                 ),
                 "output_rate": (
@@ -3630,11 +3630,11 @@ class ReaperDBLMSE:
                 "chunk_seconds": (
                     "FLOAT",
                     {
-                        "default": 12.0,
+                        "default": 0.0,
                         "min": 0.0,
                         "max": 60.0,
                         "step": 1.0,
-                        "tooltip": "Process long files in chunks to bound VRAM. 0 = whole file at once.",
+                        "tooltip": "0 = the whole file at once, like the authors' inference (best: no seams). Set 10-20 s only if long files run out of VRAM.",
                     },
                 ),
                 "device": (["auto", "cuda", "cpu"], {"default": "auto"}),
@@ -3653,7 +3653,7 @@ class ReaperDBLMSE:
         steps=5,
         strength=1.0,
         output_rate="original",
-        chunk_seconds=12.0,
+        chunk_seconds=0.0,
         device="auto",
         keep_model_loaded=True,
     ):
