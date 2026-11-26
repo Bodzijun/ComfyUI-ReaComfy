@@ -123,7 +123,7 @@ def test_voice_isolator_missing_package(nodes, monkeypatch):
         )
 
 
-# ---- 0.6.0 nodes: Nemotron RE-USE, ZONOS3, DBLM-SE ---------------------------
+# ---- 0.6.0 nodes: Nemotron RE-USE, ZONOS3 -----------------------------------
 
 
 def _naive_selective_scan(x, dt, a, b, c):
@@ -304,24 +304,7 @@ def test_zonos3_unconfigured_backends_fall_back_to_automatic(nodes, monkeypatch)
         nodes._zonos3_reference_generate("", "", {}, "cpu", "f32", 5)
 
 
-def test_dblm_code_download_failure_explains_clone(nodes, monkeypatch, tmp_path):
-    monkeypatch.setenv("DBLM_SE_REPO", str(tmp_path / "nowhere"))
-    monkeypatch.setattr(nodes, "_models_subdir", lambda name: tmp_path / name)
-
-    def offline(target):
-        raise OSError("offline")
-
-    monkeypatch.setattr(nodes, "_download_dblm_code", offline)
-    nodes._DBLM_CACHE.clear()
-    with pytest.raises(
-        RuntimeError, match="git clone https://github.com/Yorch233/DBLM-SE"
-    ):
-        nodes.ReaperDBLMSE().enhance(
-            {"waveform": torch.zeros(1, 1, 1600), "sample_rate": 16000}
-        )
-
-
-def test_dblm_code_auto_download(nodes, monkeypatch, tmp_path):
+def test_github_zip_download(nodes, monkeypatch, tmp_path):
     import io
     import urllib.request
     import zipfile
@@ -338,35 +321,13 @@ def test_dblm_code_auto_download(nodes, monkeypatch, tmp_path):
         def __exit__(self, *exc):
             return False
 
-    monkeypatch.delenv("DBLM_SE_REPO", raising=False)
-    (tmp_path / "dblm_se").mkdir()
-    monkeypatch.setattr(nodes, "_models_subdir", lambda name: tmp_path / name)
     monkeypatch.setattr(
         urllib.request, "urlopen", lambda url, timeout=0: Response(buffer.getvalue())
     )
-    repo = nodes._dblm_code_dir()
-    assert repo == tmp_path / "dblm_se" / "DBLM-SE"
+    repo = tmp_path / "code" / "DBLM-SE"
+    nodes._download_github_zip("Yorch233/DBLM-SE", repo, "src/modeling_dblm.py")
     assert (repo / "src" / "modeling_dblm.py").is_file()
-    assert [p.name for p in (tmp_path / "dblm_se").iterdir()] == ["DBLM-SE"]
-
-
-def test_rotary_standin_matches_complex_rotation(nodes):
-    rope = nodes._RotaryPositionalEmbeddings(dim=8, max_seq_len=16)
-    x = torch.randn(2, 5, 3, 8)  # [batch, seq, heads, head_dim]
-    theta = 1.0 / (10_000 ** (torch.arange(0, 8, 2).float() / 8))
-    angles = torch.arange(5).float()[:, None] * theta[None]
-    rotated = (
-        torch.view_as_complex(x.reshape(2, 5, 3, 4, 2).contiguous())
-        * torch.polar(torch.ones_like(angles), angles)[None, :, None, :]
-    )
-    expected = torch.view_as_real(rotated).flatten(3)
-    assert torch.allclose(rope(x), expected, atol=1e-5)
-    assert rope(torch.randn(1, 40, 1, 8)).shape == (
-        1,
-        40,
-        1,
-        8,
-    )  # grows past max_seq_len
+    assert [p.name for p in (tmp_path / "code").iterdir()] == ["DBLM-SE"]
 
 
 class _FakeSEMamba(torch.nn.Module):

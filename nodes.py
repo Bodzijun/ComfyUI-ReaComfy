@@ -3341,109 +3341,8 @@ class _Zonos3Runtime:
                 process.kill()
 
 
-# --------------------------------------------------------------------------
-# DBLM-SE-1B (Yorch233, Apache-2.0): generative denoise + dereverb, 16 kHz.
-# --------------------------------------------------------------------------
-
-_DBLM_CACHE = {}
-
-
-DBLM_SE_CODE_ZIP = "https://codeload.github.com/Yorch233/DBLM-SE/zip/refs/heads/main"
-DBLM_SE_MODULES = {
-    "einops": "einops",
-    "tabulate": "tabulate",
-    "accelerate": "accelerate",
-    "vector_quantize_pytorch:ResidualFSQ": "vector-quantize-pytorch>=1.14",
-    "transformers": "transformers",
-    "yaml": "pyyaml",
-    "safetensors": "safetensors",
-    "huggingface_hub": "huggingface_hub",
-}
-
-
-def _download_dblm_code(target):
-    """Fetch the DBLM-SE code (Apache-2.0) from GitHub into target."""
-    _download_github_zip("Yorch233/DBLM-SE", target, "src/modeling_dblm.py")
-
-
-def _dblm_code_dir():
-    candidates = []
-    configured = os.environ.get("DBLM_SE_REPO", "")
-    if configured:
-        candidates.append(Path(configured).expanduser())
-    default = _models_subdir("dblm_se") / "DBLM-SE"
-    candidates.append(default)
-    candidates.append(Path(__file__).resolve().parent.parent / "DBLM-SE")
-    for candidate in candidates:
-        if (candidate / "src" / "modeling_dblm.py").is_file():
-            return candidate
-    try:
-        _download_dblm_code(default)
-        return default
-    except Exception as error:
-        raise RuntimeError(
-            f"Could not download the DBLM-SE code ({error}). Clone it once "
-            "(it is Apache-2.0):\n"
-            f'  git clone https://github.com/Yorch233/DBLM-SE "{default}"\n'
-            "or set DBLM_SE_REPO to an existing checkout."
-        ) from error
-
-
-class _RotaryPositionalEmbeddings(torch.nn.Module):
-    """Same maths and buffer as torchtune.modules.RotaryPositionalEmbeddings.
-
-    XCodec2 only needs this one class from torchtune, which pins torch/torchao
-    versions that often clash with ComfyUI; it is used when torchtune is missing.
-    """
-
-    def __init__(self, dim, max_seq_len=4096, base=10_000):
-        super().__init__()
-        self.dim, self.base, self.max_seq_len = dim, base, max_seq_len
-        theta = 1.0 / (base ** (torch.arange(0, dim, 2)[: dim // 2].float() / dim))
-        self.register_buffer("theta", theta, persistent=False)
-        self._build(max_seq_len)
-
-    def _build(self, length):
-        seq = torch.arange(length, dtype=self.theta.dtype, device=self.theta.device)
-        angles = torch.einsum("i,j->ij", seq, self.theta).float()
-        cache = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
-        self.register_buffer("cache", cache, persistent=False)
-
-    def forward(self, x, *, input_pos=None):
-        seq_len = x.size(1)
-        if input_pos is None and seq_len > self.cache.shape[0]:
-            self._build(seq_len)
-        rope = self.cache[:seq_len] if input_pos is None else self.cache[input_pos]
-        shaped = x.float().reshape(*x.shape[:-1], -1, 2)
-        rope = rope.view(-1, shaped.size(1), 1, shaped.size(3), 2)
-        out = torch.stack(
-            [
-                shaped[..., 0] * rope[..., 0] - shaped[..., 1] * rope[..., 1],
-                shaped[..., 1] * rope[..., 0] + shaped[..., 0] * rope[..., 1],
-            ],
-            -1,
-        )
-        return out.flatten(3).type_as(x)
-
-
-def _torchtune_standin():
-    try:
-        import torchtune.modules  # noqa: F401
-
-        return {}
-    except Exception:
-        import types
-
-        package = types.ModuleType("torchtune")
-        modules = types.ModuleType("torchtune.modules")
-        modules.RotaryPositionalEmbeddings = _RotaryPositionalEmbeddings
-        package.modules = modules
-        package.__path__ = []
-        return {"torchtune": package, "torchtune.modules": modules}
-
-
 class _IsolatedImport:
-    """Import DBLM-SE's generic top-level packages (src, library) without
+    """Import a checkout's generic top-level packages (e.g. src, library) without
     clobbering same-named packages from other custom nodes."""
 
     NAMES = ("src", "library")
@@ -3466,7 +3365,7 @@ class _IsolatedImport:
         for key in self.saved:
             del sys.modules[key]
         self.cwd = os.getcwd()
-        os.chdir(self.repo)  # DBLM-SE reads config/models.yaml relative to cwd
+        os.chdir(self.repo)  # some checkouts read configs relative to cwd
         sys.path.insert(0, self.repo)
         # Bind each top-level package to this checkout explicitly. Folders
         # without __init__.py would otherwise lose to any regular package of
@@ -3504,212 +3403,6 @@ class _IsolatedImport:
             del sys.modules[key]
         sys.modules.update(self.saved)
         return False
-
-
-def _load_dblm(device, _retry=False):
-    cached = _DBLM_CACHE.get(device)
-    if cached is not None:
-        return cached
-    _ensure_modules(DBLM_SE_MODULES, "DBLM-SE")
-    repo = _dblm_code_dir()
-    weights = _hf_snapshot(
-        "Yorch233/DBLM-SE-1B", _models_subdir("dblm_se") / "DBLM-SE-1B"
-    )
-    wavlm = sorted((weights / "WavLM").glob("*.pt"))
-    codec = sorted((weights / "Xcodec2").glob("*.safetensors"))
-    if not wavlm or not codec or not (weights / "Wav2vec").is_dir():
-        raise RuntimeError(
-            f"DBLM-SE-1B download looks incomplete in {weights}. Delete the folder "
-            "and run again."
-        )
-    torch_device = torch.device(device)
-    try:
-        standin = _torchtune_standin()
-        with _IsolatedImport(
-            repo, names=("src", "library", *sorted(standin)), modules=standin
-        ):
-            import library  # noqa: F401  registers WavLM and XCodec2
-            from library.register import ModelRegister
-            from safetensors.torch import load_file
-            from src.common.config import read_config_from_yaml
-            from src.modeling_dblm import DBLMForSE
-            from src.sde import DDBM_VPSDE
-
-            config = read_config_from_yaml(str(weights / "config.yml"))
-            encoder = ModelRegister.fetch("WavLM")(
-                model_path=str(wavlm[0]), output_layer=6, device=torch_device
-            )
-            codec_model = ModelRegister.fetch("XCodec2")(
-                model_paths={
-                    "wav2vec": str(weights / "Wav2vec"),
-                    "codec": str(codec[0]),
-                },
-                codec_dim=2048,
-                semantic_dim=1024,
-                device=torch_device,
-            )
-            model = DBLMForSE(
-                in_dim=config.latent_dim,
-                d_model=config.model_dim,
-                nhead=config.num_head,
-                num_layers=config.num_layers,
-            )
-            state = load_file(str(weights / "model.safetensors"))
-            # The checkpoint was saved from a torch.compile wrapper.
-            state = {k.replace("_orig_mod.", "", 1): v for k, v in state.items()}
-            model.load_state_dict(state)
-            model.to(torch_device).eval()
-            sde = DDBM_VPSDE(
-                beta=config.beta, t_max=config.t_max, t_min=0, device=torch_device
-            )
-    except ImportError as error:
-        top = (error.name or "").split(".")[0]
-        needed = {
-            key: spec
-            for key, spec in DBLM_SE_MODULES.items()
-            if key.split(":")[0] == top
-        }
-        if needed and not _retry:
-            # Present but broken (e.g. a stale copy left by another node):
-            # reinstall it with an upgrade and try once more.
-            _ensure_modules(needed, "DBLM-SE", upgrade=True)
-            return _load_dblm(device, _retry=True)
-        raise RuntimeError(
-            f"DBLM-SE could not import its code: {type(error).__name__}: {error}. "
-            "Restart ComfyUI and run the node again; if it persists, send this "
-            "message to the ReaComfy thread."
-        ) from error
-    _DBLM_CACHE.clear()
-    _DBLM_CACHE[device] = (encoder, codec_model, model, sde)
-    return _DBLM_CACHE[device]
-
-
-class ReaperDBLMSE:
-    DESCRIPTION = (
-        "Generative speech denoise + dereverb with DBLM-SE-1B (Yorch233, Apache-2.0). "
-        "The model rebuilds speech from WavLM features through an XCodec2 decoder, so "
-        "badly damaged dialogue comes back clean, but the result is resynthesized at "
-        "16 kHz. Chain REAPER ClearVoice Super Resolution or LavaSR after it for 48 kHz. "
-        "Needs the DBLM-SE code checkout and ~11 GB of weights (auto-download); a CUDA "
-        "GPU with about 8 GB or more is recommended."
-    )
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "audio": ("AUDIO",),
-                "steps": (
-                    "INT",
-                    {
-                        "default": 3,
-                        "min": 1,
-                        "max": 30,
-                        "tooltip": "Diffusion-bridge sampling steps. The authors use 3; more is slower and not always cleaner.",
-                    },
-                ),
-                "strength": (
-                    "FLOAT",
-                    {
-                        "default": 1.0,
-                        "min": 0.0,
-                        "max": 1.0,
-                        "step": 0.05,
-                        "tooltip": "1.0 = only the restored voice. The voice is resynthesized, so its phase never matches the original: values below 1.0 comb-filter and smear. Keep 1.0 unless you want that.",
-                    },
-                ),
-                "output_rate": (
-                    ["original", "16000"],
-                    {
-                        "default": "original",
-                        "tooltip": "original resamples the 16 kHz result back to the input rate (no new highs).",
-                    },
-                ),
-            },
-            "optional": {
-                "chunk_seconds": (
-                    "FLOAT",
-                    {
-                        "default": 0.0,
-                        "min": 0.0,
-                        "max": 60.0,
-                        "step": 1.0,
-                        "tooltip": "0 = the whole file at once, like the authors' inference (best: no seams). Set 10-20 s only if long files run out of VRAM.",
-                    },
-                ),
-                "device": (["auto", "cuda", "cpu"], {"default": "auto"}),
-                "keep_model_loaded": ("BOOLEAN", {"default": True}),
-            },
-        }
-
-    RETURN_TYPES = ("AUDIO",)
-    RETURN_NAMES = ("audio",)
-    FUNCTION = "enhance"
-    CATEGORY = "REAPER AI/Enhancement"
-
-    def enhance(
-        self,
-        audio,
-        steps=5,
-        strength=1.0,
-        output_rate="original",
-        chunk_seconds=0.0,
-        device="auto",
-        keep_model_loaded=True,
-    ):
-        if audio is None or "waveform" not in audio:
-            raise ValueError("REAPER DBLM-SE requires an AUDIO input")
-        waveform = audio["waveform"].detach().float().cpu()
-        sample_rate = int(audio["sample_rate"])
-        if waveform.ndim == 2:
-            waveform = waveform.unsqueeze(0)
-        if waveform.ndim != 3 or waveform.shape[0] != 1:
-            raise ValueError("REAPER DBLM-SE supports one [1,C,T] audio at a time")
-        device = _resolve_device("cpu" if device == "cpu" else device)
-        if device == "mps":
-            device = "cpu"
-        encoder, codec_model, model, sde = _load_dblm(device)
-        torch_device = torch.device(device)
-        mono = _resample(waveform[0].mean(dim=0), sample_rate, 16000)
-        peak = float(mono.abs().max())
-        scale = 1.0 / peak if peak > 0 else 1.0
-
-        def run(chunk):
-            x = (chunk * scale).to(torch_device).reshape(1, 1, -1)
-            with torch.no_grad():
-                latents = encoder(x)
-                solver = sde.get_sde_solver(
-                    model_fn=lambda xt, t: model(
-                        xt,
-                        torch.full(
-                            (xt.shape[0],), t, device=xt.device, dtype=torch.float32
-                        ),
-                        return_logits=False,
-                    )
-                )
-                clean = solver.sampling(x=latents, num_steps=int(steps))
-                tokens = torch.argmax(model.get_logits(clean), dim=1)
-                out = codec_model.token2audio(tokens.unsqueeze(0))
-            return out.float().cpu() / scale
-
-        try:
-            restored = _process_in_chunks(mono, 16000, float(chunk_seconds), 1.0, run)
-        finally:
-            if not keep_model_loaded:
-                _DBLM_CACHE.clear()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        if output_rate == "16000":
-            out_rate = 16000
-            dry = mono
-        else:
-            out_rate = sample_rate
-            restored = _resample(restored, 16000, sample_rate)
-            dry = waveform[0].mean(dim=0)
-        restored = _fit_length(restored, dry.shape[-1])
-        amount = float(strength)
-        mixed = dry + amount * (restored - dry) if amount < 1.0 else restored
-        return ({"waveform": mixed.reshape(1, 1, -1), "sample_rate": out_rate},)
 
 
 # --------------------------------------------------------------------------
@@ -4742,7 +4435,6 @@ NODE_CLASS_MAPPINGS = {
     "REAPERNemotronReUSE": ReaperNemotronReUSE,
     "REAPERZonos3TTS": ReaperZonos3TTS,
     "REAPERZonos3SpeechEdit": ReaperZonos3SpeechEdit,
-    "REAPERDBLMSE": ReaperDBLMSE,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "REAPERInput": "REAPER Input",
@@ -4769,5 +4461,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "REAPERNemotronReUSE": "REAPER Nemotron RE-USE (Universal Speech Enhancement)",
     "REAPERZonos3TTS": "REAPER ZONOS3 TTS (Voice Clone + Emotion/Accent)",
     "REAPERZonos3SpeechEdit": "REAPER ZONOS3 Speech Edit (Fix a Slip of the Tongue)",
-    "REAPERDBLMSE": "REAPER DBLM-SE (Generative Denoise + Dereverb)",
 }

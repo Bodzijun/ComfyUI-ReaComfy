@@ -191,28 +191,6 @@ Everything installs itself on the first edit, inside the private ZONOS3
 environment: FuseAlign (Zyphra, Apache-2.0, ~1.3 GB checkpoint) and the
 speech-edit LoRA from `Zyphra/ZONOS3-Mini`. Needs an NVIDIA GPU.
 
-### DBLM-SE-1B
-
-`REAPER DBLM-SE (Generative Denoise + Dereverb)` uses
-[Yorch233/DBLM-SE-1B](https://huggingface.co/Yorch233/DBLM-SE-1B) (Apache-2.0).
-It rebuilds speech from WavLM features through an XCodec2 decoder, so badly
-damaged, noisy and reverberant dialogue comes back clean. The result is
-resynthesized at **16 kHz**: chain `REAPER ClearVoice Super Resolution` or
-`REAPER LavaSR v2` after it for full band. A CUDA GPU with about 8 GB or more
-is recommended.
-
-Everything is automatic: the DBLM-SE code (Apache-2.0) downloads into
-`ComfyUI/models/dblm_se/DBLM-SE/` and its extra modules (`einops`, `tabulate`,
-`accelerate`, `vector-quantize-pytorch`, `transformers`, `pyyaml`) are installed
-into ComfyUI's Python on first use. DBLM-SE's own `requirements.txt` (which pins
-an old PyTorch) is never used, and `torchtune` is replaced by an identical
-built-in rotary-embedding module.
-
-`DBLM_SE_REPO` can point to another checkout. The weights (~11 GB: model,
-WavLM-Large, w2v-BERT and XCodec2) download on first use into
-`ComfyUI/models/dblm_se/DBLM-SE-1B/`. `steps` sets the sampling steps (3–10 is
-typical), `chunk_seconds` bounds VRAM on long files.
-
 ### DeepFilterNet / Egregora
 
 `REAPER ClearVoice` is independent from Egregora's DeepFilterNet nodes. If
