@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-reacomfy"
 description = "REAPER <-> ComfyUI bridge nodes: send audio, MIDI, text and video from REAPER, process it in ComfyUI (voice isolation, enhancement, EQ/room match, YuE2 helpers) and import results back to the timeline."
-version = "0.6.0"
+version = "0.6.1"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
