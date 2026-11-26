@@ -552,3 +552,84 @@ def test_zonos3_worker_windows_shims(nodes, monkeypatch):
 
     assert sys.modules["fcntl"].flock(None, sys.modules["fcntl"].LOCK_EX) is None
     assert os.environ["ZONOS3_AUDIO_CODEC_DEVICE"] == "cpu"
+
+
+def test_zonos3_edit_request_modes(nodes):
+    spans = nodes.zonos3_edit_request(
+        "QQ", " fixed  text ", "", "en_us", 1.2, 1.9, 0, 0.7
+    )
+    assert spans["spans"] == [[1.2, 1.9]] and spans["target_text"] == "fixed text"
+    assert "seed" not in spans and "original_text" not in spans
+    diff = nodes.zonos3_edit_request("QQ", "a b", "a c", "uk", -1, -1, 5, 0.7)
+    assert diff["original_text"] == "a c" and "spans" not in diff and diff["seed"] == 5
+    with pytest.raises(ValueError, match="original text"):
+        nodes.zonos3_edit_request("QQ", "a b", "", "uk", -1, -1, 0, 0.7)
+    with pytest.raises(ValueError, match="corrected text"):
+        nodes.zonos3_edit_request("QQ", "  ", "a", "uk", -1, -1, 0, 0.7)
+
+
+def test_zonos3_speech_edit_node(nodes, monkeypatch):
+    seen = {}
+
+    def fake_edit(request, device, timeout):
+        seen.update(request)
+        return torch.zeros(44100), 44100, 11, {"spans": [[0.5, 0.9]]}
+
+    monkeypatch.setattr(nodes._Zonos3Runtime, "edit", staticmethod(fake_edit))
+    clip = {"waveform": torch.zeros(1, 2, 48000), "sample_rate": 48000}
+    audio, info = nodes.ReaperZonos3SpeechEdit().edit(
+        clip, "the right word", "the wrong word", "en_us"
+    )
+    assert audio["sample_rate"] == 48000 and audio["waveform"].shape[-1] == 48000
+    assert json.loads(info)["seed"] == 11
+    assert seen["original_text"] == "the wrong word" and "audio_base64" in seen
+
+
+FAKE_ZONOS3_EDIT_WORKER = r"""
+import json, sys, wave
+edit_folder = sys.argv[4] if len(sys.argv) > 4 else ""
+sys.stdout.write("@@REACOMFY " + json.dumps({"ready": True, "edit": bool(edit_folder)}) + "\n"); sys.stdout.flush()
+for line in sys.stdin:
+    job = json.loads(line)
+    with wave.open(job["out"], "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(44100)
+        w.writeframes(b"\x00\x10" * 100)
+    reply = {"ok": True, "seed": 3}
+    if "edit" in job:
+        reply["info"] = {"target": job["edit"]["target_text"], "folder": edit_folder}
+    sys.stdout.write("@@REACOMFY " + json.dumps(reply) + "\n"); sys.stdout.flush()
+"""
+
+
+def test_zonos3_edit_worker_restarts_with_adapter(nodes, monkeypatch, tmp_path):
+    base = tmp_path / "zonos3"
+    base.mkdir()
+    monkeypatch.setattr(nodes, "ZONOS3_WORKER", FAKE_ZONOS3_EDIT_WORKER)
+    runtime = nodes._Zonos3Runtime
+    extras = []
+    monkeypatch.setattr(runtime, "base", staticmethod(lambda: base))
+    monkeypatch.setattr(
+        runtime, "python", classmethod(lambda cls: Path(sys.executable))
+    )
+    monkeypatch.setattr(runtime, "ensure_installed", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(
+        runtime, "ensure_edit_extras", classmethod(lambda cls: extras.append(1))
+    )
+    try:
+        runtime.generate({"text": "hi"}, "cpu", 60)
+        plain = runtime.process
+        samples, rate, seed, info = runtime.edit({"target_text": "fixed"}, "cpu", 60)
+        assert runtime.process is not plain  # restarted with the edit adapter
+        assert info["target"] == "fixed" and info["folder"].endswith("edit_adapter")
+        edit_process = runtime.process
+        runtime.generate({"text": "again"}, "cpu", 60)
+        assert runtime.process is edit_process  # the edit worker also serves TTS
+        assert extras == [1, 1] or extras == [1]
+    finally:
+        runtime.stop()
+    assert rate == 44100 and seed == 3
+
+
+def test_zonos3_worker_script_compiles(nodes):
+    compile(nodes.ZONOS3_WORKER, "worker", "exec")
+    compile(nodes.ZONOS3_WINSHIM, "winshim", "exec")

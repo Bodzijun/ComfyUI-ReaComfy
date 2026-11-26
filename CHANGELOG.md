@@ -13,6 +13,7 @@ All notable changes to ReaComfy are documented here.
 
 ### Added
 
+- `REAPER ZONOS3 Speech Edit (Fix a Slip of the Tongue)`: regenerates only the changed words of recorded speech in the speaker's voice (ZONOS3-Mini speech-edit LoRA). The words to fix come from the original vs corrected text (FuseAlign word timings) or from an edit region in seconds; FuseAlign and the adapter install themselves on the first edit. Example workflow `reaper_zonos3_speech_edit.json`.
 - `REAPER Nemotron RE-USE (Universal Speech Enhancement)`: NVIDIA's commercial-use RE-USE model (OpenMDW-1.1) for noise, reverb, clipping, codec and bandwidth damage at 8–48 kHz, with `speech` and `removed` outputs, optional bandwidth extension and chunked processing. Runs with `mamba-ssm` on Linux + CUDA or a built-in PyTorch Mamba scan everywhere else.
 - `REAPER ZONOS3 TTS (Voice Clone + Emotion/Accent)`: Zyphra ZONOS3-Mini text-to-speech (43 languages incl. Ukrainian) with voice cloning from a REAPER item and steering controls for emotion, pace, projection, mood, accent, texture and room. By default ReaComfy installs ZONOS3 into its own Python 3.12 environment on first use and keeps it loaded in a background worker (no terminal, no server to launch); an external ZONOS3 server or venv can still be used.
 - `REAPER DBLM-SE (Generative Denoise + Dereverb)`: DBLM-SE-1B (Apache-2.0) generative speech restoration (16 kHz output), chunked for long files.

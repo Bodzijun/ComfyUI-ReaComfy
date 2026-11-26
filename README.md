@@ -170,6 +170,27 @@ Advanced alternatives: `server` talks to a ZONOS3 server you run yourself
 from your own checkout (`zonos3_home` / `zonos3_python` or `ZONOS3_HOME` /
 `ZONOS3_PYTHON`).
 
+### ZONOS3 Speech Edit (fix a slip of the tongue)
+
+`REAPER ZONOS3 Speech Edit (Fix a Slip of the Tongue)` regenerates only the
+changed words of a recorded clip in the speaker's own voice with ZONOS3-Mini's
+speech-edit adapter; every other codec frame of the recording is kept exactly.
+Give it the selected REAPER item (keep it short: one or two sentences), the
+`corrected_text` (what the whole clip should say) and either:
+
+- `original_text`: what the clip says now, slip included. FuseAlign finds the
+  words that differ and only those are regenerated; or
+- `edit_start` / `edit_end`: the part to regenerate, in seconds from the clip
+  start (useful when the aligner misplaces a word).
+
+`seed` 0 is random; change it for another take. The result is the whole clip
+with the fix, at the item's sample rate (`match_input_rate`). Clips longer than
+16 s are edited in windows around the change and need `original_text`.
+
+Everything installs itself on the first edit, inside the private ZONOS3
+environment: FuseAlign (Zyphra, Apache-2.0, ~1.3 GB checkpoint) and the
+speech-edit LoRA from `Zyphra/ZONOS3-Mini`. Needs an NVIDIA GPU.
+
 ### DBLM-SE-1B
 
 `REAPER DBLM-SE (Generative Denoise + Dereverb)` uses
