@@ -1,0 +1,5 @@
+# Installed into the Python environment that runs ComfyUI.
+# torch and torchaudio come with ComfyUI and are not reinstalled here.
+numpy
+soundfile
+inworld-voice-isolation>=1.0.0
