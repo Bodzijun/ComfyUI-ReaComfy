@@ -2685,8 +2685,11 @@ class _IsolatedImport:
 
     NAMES = ("src", "library")
 
-    def __init__(self, repo):
+    def __init__(self, repo, names=None, modules=None):
         self.repo = str(repo)
+        if names is not None:
+            self.NAMES = tuple(names)
+        self.modules = dict(modules or {})  # pre-bound stand-ins (e.g. mamba_ssm)
 
     def _owned(self):
         return {
@@ -2702,6 +2705,30 @@ class _IsolatedImport:
         self.cwd = os.getcwd()
         os.chdir(self.repo)  # DBLM-SE reads config/models.yaml relative to cwd
         sys.path.insert(0, self.repo)
+        # Bind each top-level package to this checkout explicitly. Folders
+        # without __init__.py would otherwise lose to any regular package of
+        # the same name elsewhere on sys.path (common with many custom nodes).
+        import importlib.util
+        import types
+
+        sys.modules.update(self.modules)
+        for name in self.NAMES:
+            folder = Path(self.repo) / name
+            if not folder.is_dir():
+                continue
+            init = folder / "__init__.py"
+            if init.is_file():
+                spec = importlib.util.spec_from_file_location(
+                    name, init, submodule_search_locations=[str(folder)]
+                )
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[name] = module
+                spec.loader.exec_module(module)
+            else:
+                module = types.ModuleType(name)
+                module.__path__ = [str(folder)]
+                module.__package__ = name
+                sys.modules[name] = module
         return self
 
     def __exit__(self, *exc):
@@ -3521,10 +3548,10 @@ def _load_reuse(device, backend):
                 )
             native = None
     shim = native or types.SimpleNamespace(Mamba=_MambaFallback)
-    importer = _IsolatedImport(root)
-    importer.NAMES = ("models", "utils", "mamba_ssm")
+    importer = _IsolatedImport(
+        root, names=("models", "utils", "mamba_ssm"), modules={"mamba_ssm": shim}
+    )
     with importer:
-        sys.modules["mamba_ssm"] = shim
         from models.generator_SEMamba_time_d4 import SEMamba
         from models.stfts import mag_phase_istft, mag_phase_stft
 

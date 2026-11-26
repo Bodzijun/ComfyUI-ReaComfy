@@ -304,3 +304,25 @@ def test_reuse_node_with_fake_model(nodes, monkeypatch):
         {"waveform": tone[:, :1, :16000], "sample_rate": 16000},
         bandwidth_extension="48000", channels="mono", chunk_seconds=0, device="cpu")
     assert bwe["sample_rate"] == 48000 and bwe["waveform"].shape == (1, 1, 48000)
+
+
+def test_isolated_import_beats_regular_package_elsewhere(nodes, tmp_path, monkeypatch):
+    # Another custom node ships a regular "models" package on sys.path ...
+    other = tmp_path / "other"
+    (other / "models").mkdir(parents=True)
+    (other / "models" / "__init__.py").write_text("OWNER = 'other'\n")
+    monkeypatch.syspath_prepend(str(other))
+    # ... while the checkout's models/ has no __init__.py (RE-USE layout).
+    repo = tmp_path / "repo"
+    (repo / "models").mkdir(parents=True)
+    (repo / "models" / "net.py").write_text(
+        "from .helper import VALUE\nfrom mamba_ssm import Mamba\n"
+    )
+    (repo / "models" / "helper.py").write_text("VALUE = 'repo'\n")
+    shim = types.SimpleNamespace(Mamba="fallback")
+    with nodes._IsolatedImport(repo, names=("models", "mamba_ssm"), modules={"mamba_ssm": shim}):
+        from models.net import VALUE, Mamba
+
+    assert VALUE == "repo" and Mamba == "fallback"
+    assert "models" not in sys.modules or getattr(sys.modules["models"], "OWNER", None) != "repo"
+    assert sys.modules.get("mamba_ssm") is not shim
