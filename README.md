@@ -1,4 +1,4 @@
-# ComfyUI-ReaComfy — REAPER Bridge nodes (ReaComfy 0.5.2)
+# ComfyUI-ReaComfy — REAPER Bridge nodes (ReaComfy 0.5.3)
 
 ComfyUI custom nodes that exchange audio, MIDI, text and video with the active
 REAPER project. They are the ComfyUI half of
@@ -139,7 +139,7 @@ Additional YuE2 helpers are available when YuE2-ComfyUI is installed:
 - `REAPER Score Output` saves ABC and optional lyrics into the project cache and exports the same score to MIDI by default. The MIDI can be imported back into REAPER with `ReaComfy - Import Score Output.lua`.
 - `REAPER Chords → ABC (Chord-only)` builds a valid two-voice YuE2 score from sectioned chord text without requiring MIDI. Set BPM and key, then connect its `score_abc` output to `YuE2 Generate Song` or `REAPER Score Output`.
 - `REAPER Video Input` exposes `video_path`, native `video`, `woosh_video`, `images`, and `fps`. `limit_duration` is disabled by default for compatibility; enable it when a downstream frame-based pipeline should use only `max_duration_s` seconds.
-- `REAPER Audio Inpaint / De-Click Repair` is a lightweight CPU restoration node for short clicks, crackles and small dropouts. It uses conservative median-residual detection and interpolation from neighboring samples; adjust `sensitivity`, `max_repair_ms` and `strength`. It requires SciPy (`pip install scipy`) but no additional model.
+- `REAPER Audio Inpaint / De-Click Repair` is a lightweight CPU restoration node for short clicks, crackles and small dropouts. It uses conservative median-residual detection and interpolation from neighboring samples; adjust `sensitivity`, `max_repair_ms` and `strength`. It uses SciPy (installed with the pack) and needs no additional model.
 - `REAPER EQ Match` uses deterministic STFT/iSTFT DSP to match a target recording to a reference spectrum. It includes strength, maximum correction, smoothing, and low/high frequency limits; it does not use an AI model or change timing.
 - `REAPER Dynamic Voice Match` is the dialogue-oriented variant. It follows the target spectrum frame by frame with voice gating and slow temporal smoothing, helping stabilize interview and lavalier recordings whose tone changes with distance or mic angle. Use a clean speech excerpt as `reference_audio`; start with match strength 0.35–0.50 and maximum correction 2–3 dB.
 - `REAPER Dynamic Voice Leveler` is an offline speech-dynamics processor. It smooths short-term voice level, leaves gated pauses mostly unchanged, limits the correction range, and applies a final peak safety stage. A practical dialogue starting point is target `-20 dB`, gate `-45 dB`, max gain/cut `6 dB`, attack `120 ms`, release `650 ms`, ceiling `-1 dB`.

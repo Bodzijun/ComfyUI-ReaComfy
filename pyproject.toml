@@ -1,21 +1,18 @@
 [project]
 name = "comfyui-reacomfy"
 description = "REAPER <-> ComfyUI bridge nodes: send audio, MIDI, text and video from REAPER, process it in ComfyUI (voice isolation, enhancement, EQ/room match, YuE2 helpers) and import results back to the timeline."
-version = "0.5.2"
+version = "0.5.3"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
   "numpy",
   "soundfile",
+  "scipy",
   "inworld-voice-isolation>=1.0.0",
 ]
 classifiers = [
   "Operating System :: OS Independent",
 ]
-
-[project.optional-dependencies]
-restoration = ["scipy", "clearvoice"]
-dev = ["pytest"]
 
 [project.urls]
 Repository = "https://github.com/Bodzijun/ComfyUI-ReaComfy"

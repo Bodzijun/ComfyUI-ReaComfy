@@ -2,6 +2,13 @@
 
 All notable changes to ReaComfy are documented here.
 
+## [0.5.3] - 2026-11-26
+
+### Fixed
+
+- Removed the optional `restoration` extra (`clearvoice`) from the package metadata. ComfyUI-Manager tried to install it and failed; ClearVoice stays an optional manual install (see README).
+- `scipy` (used by Audio Inpaint and Room Match) is now a regular requirement.
+
 ## [0.5.2] - 2026-11-26
 
 ### Changed

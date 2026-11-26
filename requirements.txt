@@ -2,4 +2,5 @@
 # torch and torchaudio come with ComfyUI and are not reinstalled here.
 numpy
 soundfile
+scipy
 inworld-voice-isolation>=1.0.0
