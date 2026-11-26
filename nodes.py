@@ -2549,13 +2549,9 @@ def _hf_snapshot(repo_id, local_dir, allow_patterns=None):
     marker = local_dir / ".reacomfy_complete"
     if marker.is_file():
         return local_dir
-    try:
-        from huggingface_hub import snapshot_download
-    except ImportError as error:
-        raise RuntimeError(
-            "huggingface_hub is required to download model weights. Install it in "
-            "the ComfyUI environment with: python -m pip install huggingface_hub"
-        ) from error
+    _ensure_modules({"huggingface_hub": "huggingface_hub"}, "model downloads")
+    from huggingface_hub import snapshot_download
+
     snapshot_download(
         repo_id=repo_id, local_dir=str(local_dir), allow_patterns=allow_patterns
     )
@@ -2651,6 +2647,342 @@ def _fit_length(samples, length):
     return torch.nn.functional.pad(samples, (0, length - samples.shape[-1]))
 
 
+def _ensure_modules(requirements, purpose):
+    """Install missing Python modules into ComfyUI's own environment.
+
+    requirements: {import_name: pip_spec}. REAPER users should never need a
+    terminal, so missing optional modules are installed on first use with the
+    interpreter that runs ComfyUI (sys.executable). Installed packages that
+    are already satisfied (e.g. torch) are never upgraded.
+    """
+    import importlib
+    import subprocess
+
+    missing = []
+    for module, spec in requirements.items():
+        try:
+            importlib.import_module(module)
+        except Exception:
+            missing.append(spec)
+    if not missing:
+        return
+    print(f"[ReaComfy] Installing modules for {purpose}: {' '.join(missing)}")
+    command = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check"]
+    completed = subprocess.run(
+        command + missing, capture_output=True, text=True, timeout=1800
+    )
+    if completed.returncode != 0:
+        tail = (completed.stderr or completed.stdout or "")[-1500:]
+        raise RuntimeError(
+            f"ReaComfy could not install {', '.join(missing)} for {purpose}:\n{tail}"
+        )
+    importlib.invalidate_caches()
+
+
+def _download_github_zip(owner_repo, target, marker):
+    """Download a GitHub repository's main branch as a zip into target."""
+    import io
+    import tempfile
+    import urllib.request
+    import zipfile
+
+    url = f"https://codeload.github.com/{owner_repo}/zip/refs/heads/main"
+    print(f"[ReaComfy] Downloading {owner_repo} code into {target}")
+    with urllib.request.urlopen(url, timeout=300) as response:
+        payload = response.read()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix="reacomfy_code_", dir=str(target.parent)))
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            archive.extractall(staging)
+        roots = [p for p in staging.iterdir() if p.is_dir()]
+        if len(roots) != 1 or not (roots[0] / marker).exists():
+            raise RuntimeError(f"Unexpected {owner_repo} archive layout")
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.move(str(roots[0]), str(target))
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# Managed ZONOS3 runtime: ZONOS3 pins Python 3.12 and its own torch, so
+# ReaComfy builds a private environment for it on first use (uv downloads
+# Python 3.12 itself) and keeps one worker process with the model loaded.
+# --------------------------------------------------------------------------
+
+ZONOS3_TORCH = ("torch==2.9.1", "torchaudio==2.9.1")
+ZONOS3_DEPS = [
+    "descript-audio-codec==1.0.0",
+    "transformers>=4.56.0,<=4.57.3",
+    "huggingface_hub",
+    "pyyaml",
+    "omegaconf",
+    "numpy",
+    "soundfile",
+    "tokenizers",
+    "kernels>=0.12.1",
+    "zyphra-textnorm==0.2.0",
+    "lmdb>=1.4",
+    "fastapi",
+    "pydantic>=2",
+    "pyicu-wheels>=2.14,<2.16",
+]
+ZONOS3_SETUP_VERSION = "1"
+
+ZONOS3_WORKER = r'''
+"""ReaComfy's ZONOS3 worker: loads the model once, then serves requests.
+
+Protocol: one JSON object per stdin line {"request": GenerateRequest, "out": wav};
+answers are stdout lines starting with "@@REACOMFY " followed by JSON.
+"""
+import json
+import sys
+import traceback
+
+
+def say(payload):
+    sys.stdout.write("@@REACOMFY " + json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+
+def main():
+    device, dtype_name, bundle = sys.argv[1], sys.argv[2], sys.argv[3]
+    import io
+    import wave
+
+    import soundfile as sf
+    import torch
+
+    import zonos3.tts.audio as zaudio
+    from zonos3.generation import SAMPLE_RATE
+    from zonos3.reference.lm import Zonos3LM
+    from zonos3.reference.synth import ReferenceAssets, synthesize
+    from zonos3.tts.audio import write_pcm16_wav
+    from zonos3.utils import release
+
+    original = zaudio._transcode_audio_bytes_to_wav
+
+    def to_wav(audio_bytes):
+        # ReaComfy sends PCM WAV; decode it without needing ffmpeg.
+        try:
+            data, rate = sf.read(io.BytesIO(audio_bytes), dtype="int16", always_2d=True)
+        except Exception:
+            return original(audio_bytes)
+        out = io.BytesIO()
+        with wave.open(out, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(rate)
+            handle.writeframes(data.mean(axis=1).astype("int16").tobytes())
+        return out.getvalue()
+
+    zaudio._transcode_audio_bytes_to_wav = to_wav
+    dtype = torch.bfloat16 if dtype_name == "bf16" else torch.float32
+    lm = Zonos3LM.load(release.RELEASE_LM, device=torch.device(device), dtype=dtype)
+    assets = ReferenceAssets.load(steer_bundle=bundle or None, accent_adapters=None, laci_heads={})
+    assets.grow(lm)
+    if release.RELEASE_TEXT_ROWS:
+        from zonos3.models.text_extra import TextExtraRows
+
+        lm.append_text_rows(TextExtraRows.load(release.RELEASE_TEXT_ROWS))
+    say({"ready": True})
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            job = json.loads(line)
+            result = synthesize(lm, job["request"], assets=assets, device=torch.device(device), dtype=dtype)
+            write_pcm16_wav(job["out"], result.pcm, SAMPLE_RATE)
+            say({"ok": True, "seed": result.seed})
+        except Exception:
+            say({"ok": False, "error": traceback.format_exc()[-3000:]})
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        say({"ok": False, "fatal": True, "error": traceback.format_exc()[-3000:]})
+        raise
+'''
+
+
+class _Zonos3Runtime:
+    """Builds the private ZONOS3 environment and owns the worker process."""
+
+    process = None
+    process_key = None
+
+    @staticmethod
+    def base():
+        return _models_subdir("zonos3")
+
+    @classmethod
+    def python(cls):
+        venv = cls.base() / "venv"
+        if os.name == "nt":
+            return venv / "Scripts" / "python.exe"
+        return venv / "bin" / "python"
+
+    @classmethod
+    def _run(cls, command, log, timeout=3600):
+        import subprocess
+
+        log.write("\n$ " + " ".join(str(c) for c in command) + "\n")
+        log.flush()
+        completed = subprocess.run(
+            [str(c) for c in command],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            cwd=str(cls.base()),
+        )
+        if completed.returncode != 0:
+            log.flush()
+            tail = Path(log.name).read_text(encoding="utf-8", errors="replace")[-2000:]
+            raise RuntimeError(f"ZONOS3 setup step failed:\n{tail}")
+
+    @classmethod
+    def torch_index(cls):
+        if sys.platform == "darwin":
+            return None
+        if torch.cuda.is_available():
+            return "https://download.pytorch.org/whl/cu128"
+        return "https://download.pytorch.org/whl/cpu"
+
+    @classmethod
+    def ensure_installed(cls):
+        base = cls.base()
+        home = base / "ZONOS3"
+        marker = base / f".setup_v{ZONOS3_SETUP_VERSION}"
+        if marker.is_file() and cls.python().is_file() and home.is_dir():
+            return home
+        print(
+            "[ReaComfy] First ZONOS3 run: preparing its own Python 3.12 environment "
+            "(several GB, can take 10-30 minutes). Progress: " + str(base / "setup.log")
+        )
+        if not (home / "model" / "pyproject.toml").is_file():
+            _download_github_zip("Zyphra/ZONOS3", home, "model/pyproject.toml")
+        _ensure_modules({"uv": "uv"}, "the ZONOS3 environment")
+        uv = [sys.executable, "-m", "uv"]
+        with open(base / "setup.log", "a", encoding="utf-8") as log:
+            if not cls.python().is_file():
+                cls._run(uv + ["venv", "--python", "3.12", str(base / "venv")], log)
+            pip = uv + ["pip", "install", "--python", str(cls.python())]
+            index = cls.torch_index()
+            torch_cmd = pip + list(ZONOS3_TORCH)
+            if index:
+                torch_cmd += ["--index-url", index]
+            cls._run(torch_cmd, log)
+            cls._run(pip + ZONOS3_DEPS, log)
+            # fusealign-hub (speech editing only) is not on PyPI: skip deps.
+            cls._run(pip + ["--no-deps", str(home / "model")], log)
+        (base / "reacomfy_zonos3_worker.py").write_text(ZONOS3_WORKER, encoding="utf-8")
+        marker.write_text("ok", encoding="utf-8")
+        return home
+
+    @classmethod
+    def worker(cls, device, timeout):
+        import subprocess
+
+        home = cls.ensure_installed()
+        script = cls.base() / "reacomfy_zonos3_worker.py"
+        if not script.is_file():
+            script.write_text(ZONOS3_WORKER, encoding="utf-8")
+        device = _resolve_device(device)
+        dtype = "bf16" if device == "cuda" else "f32"
+        key = (device, dtype)
+        process = cls.process
+        if process is not None and process.poll() is None and cls.process_key == key:
+            return process
+        cls.stop()
+        bundle = home / ZONOS3_BUNDLE
+        log = open(cls.base() / "worker.log", "a", encoding="utf-8")
+        print("[ReaComfy] Starting ZONOS3 (first start downloads ~9 GB of weights)")
+        process = subprocess.Popen(
+            [
+                str(cls.python()),
+                str(script),
+                device,
+                dtype,
+                str(bundle) if bundle.is_file() else "",
+            ],
+            cwd=str(home),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=log,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+        )
+        cls.process, cls.process_key = process, key
+        reply = cls._read(process, max(int(timeout), 7200))
+        if not reply.get("ready"):
+            cls.stop()
+            raise RuntimeError("ZONOS3 failed to start:\n" + reply.get("error", ""))
+        return process
+
+    @classmethod
+    def _read(cls, process, timeout):
+        import threading
+
+        result = {}
+
+        def reader():
+            for line in process.stdout:
+                if line.startswith("@@REACOMFY "):
+                    result.update(json.loads(line[len("@@REACOMFY ") :]))
+                    return
+
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        thread.join(timeout)
+        if thread.is_alive():
+            cls.stop()
+            raise RuntimeError(f"ZONOS3 did not answer within {timeout} s")
+        if not result:
+            log = cls.base() / "worker.log"
+            tail = (
+                log.read_text(encoding="utf-8", errors="replace")[-2000:]
+                if log.is_file()
+                else ""
+            )
+            cls.stop()
+            raise RuntimeError("ZONOS3 worker exited:\n" + tail)
+        return result
+
+    @classmethod
+    def generate(cls, request, device, timeout):
+        import tempfile
+
+        process = cls.worker(device, timeout)
+        out = Path(tempfile.mkdtemp(prefix="reacomfy_zonos3_")) / "out.wav"
+        try:
+            process.stdin.write(
+                json.dumps({"request": request, "out": str(out)}) + "\n"
+            )
+            process.stdin.flush()
+            reply = cls._read(process, timeout)
+            if not reply.get("ok"):
+                raise RuntimeError("ZONOS3 error:\n" + reply.get("error", ""))
+            samples, rate = sf.read(str(out), dtype="float32", always_2d=True)
+            return torch.from_numpy(samples.mean(axis=1)), int(rate), reply.get("seed")
+        finally:
+            shutil.rmtree(out.parent, ignore_errors=True)
+
+    @classmethod
+    def stop(cls):
+        process, cls.process = cls.process, None
+        if process is not None and process.poll() is None:
+            try:
+                process.stdin.close()
+                process.wait(timeout=10)
+            except Exception:
+                process.kill()
+
+
 # --------------------------------------------------------------------------
 # DBLM-SE-1B (Yorch233, Apache-2.0): generative denoise + dereverb, 16 kHz.
 # --------------------------------------------------------------------------
@@ -2663,27 +2995,8 @@ DBLM_SE_DEPS = "einops tabulate accelerate vector-quantize-pytorch transformers 
 
 
 def _download_dblm_code(target):
-    """Fetch the DBLM-SE code (Apache-2.0) as a zip from GitHub into target."""
-    import io
-    import tempfile
-    import urllib.request
-    import zipfile
-
-    print(f"[ReaComfy] Downloading DBLM-SE code into {target}")
-    with urllib.request.urlopen(DBLM_SE_CODE_ZIP, timeout=120) as response:
-        payload = response.read()
-    staging = Path(tempfile.mkdtemp(prefix="reacomfy_dblm_", dir=str(target.parent)))
-    try:
-        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-            archive.extractall(staging)
-        roots = [p for p in staging.iterdir() if p.is_dir()]
-        if len(roots) != 1 or not (roots[0] / "src" / "modeling_dblm.py").is_file():
-            raise RuntimeError("Unexpected DBLM-SE archive layout")
-        if target.exists():
-            shutil.rmtree(target)
-        shutil.move(str(roots[0]), str(target))
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
+    """Fetch the DBLM-SE code (Apache-2.0) from GitHub into target."""
+    _download_github_zip("Yorch233/DBLM-SE", target, "src/modeling_dblm.py")
 
 
 def _dblm_code_dir():
@@ -2830,6 +3143,19 @@ def _load_dblm(device):
     cached = _DBLM_CACHE.get(device)
     if cached is not None:
         return cached
+    _ensure_modules(
+        {
+            "einops": "einops",
+            "tabulate": "tabulate",
+            "accelerate": "accelerate",
+            "vector_quantize_pytorch": "vector-quantize-pytorch",
+            "transformers": "transformers",
+            "yaml": "pyyaml",
+            "safetensors": "safetensors",
+            "huggingface_hub": "huggingface_hub",
+        },
+        "DBLM-SE",
+    )
     repo = _dblm_code_dir()
     weights = _hf_snapshot(
         "Yorch233/DBLM-SE-1B", _models_subdir("dblm_se") / "DBLM-SE-1B"
@@ -3272,10 +3598,10 @@ class ReaperZonos3TTS:
                 ),
                 "language": (ZONOS3_LANGUAGES, {"default": "uk"}),
                 "backend": (
-                    ["server", "reference (venv)"],
+                    ["automatic", "server", "reference (venv)"],
                     {
-                        "default": "server",
-                        "tooltip": "server: a running ZONOS3 server (model stays loaded). reference: one-off run of zonos3.reference in its own venv (reloads the model each time).",
+                        "default": "automatic",
+                        "tooltip": "automatic: ReaComfy installs ZONOS3 in its own environment on first use and keeps it loaded (nothing to set up). server: an existing ZONOS3 server. reference: zonos3.reference from your own venv.",
                     },
                 ),
                 "emotion": (list(ZONOS3_EMOTIONS), {"default": "none"}),
@@ -3418,7 +3744,7 @@ class ReaperZonos3TTS:
         self,
         text,
         language="uk",
-        backend="server",
+        backend="automatic",
         emotion="none",
         emotion_strength=1.0,
         pace=0.0,
@@ -3498,7 +3824,11 @@ class ReaperZonos3TTS:
             request = self.build_request(
                 part, language, controls, seed, kwargs, speaker
             )
-            if backend == "server":
+            if backend == "automatic":
+                samples, rate, used_seed = _Zonos3Runtime.generate(
+                    request, device, int(timeout_s)
+                )
+            elif backend == "server":
                 samples, rate, used_seed = _zonos3_server_generate(
                     server_url, request, access_token, int(timeout_s)
                 )
@@ -3615,6 +3945,15 @@ def _load_reuse(device, backend):
         return _REUSE_CACHE[key]
     import types
 
+    _ensure_modules(
+        {
+            "einops": "einops",
+            "yaml": "pyyaml",
+            "safetensors": "safetensors",
+            "huggingface_hub": "huggingface_hub",
+        },
+        "Nemotron RE-USE",
+    )
     import yaml
     from safetensors.torch import load_file
 

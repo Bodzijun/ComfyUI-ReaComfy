@@ -7,8 +7,9 @@ All notable changes to ReaComfy are documented here.
 ### Added
 
 - `REAPER Nemotron RE-USE (Universal Speech Enhancement)`: NVIDIA's commercial-use RE-USE model (OpenMDW-1.1) for noise, reverb, clipping, codec and bandwidth damage at 8–48 kHz, with `speech` and `removed` outputs, optional bandwidth extension and chunked processing. Runs with `mamba-ssm` on Linux + CUDA or a built-in PyTorch Mamba scan everywhere else.
-- `REAPER ZONOS3 TTS (Voice Clone + Emotion/Accent)`: Zyphra ZONOS3-Mini text-to-speech (43 languages incl. Ukrainian) with voice cloning from a REAPER item and steering controls for emotion, pace, projection, mood, accent, texture and room. Talks to a ZONOS3 server or the ZONOS3 reference in its own venv.
+- `REAPER ZONOS3 TTS (Voice Clone + Emotion/Accent)`: Zyphra ZONOS3-Mini text-to-speech (43 languages incl. Ukrainian) with voice cloning from a REAPER item and steering controls for emotion, pace, projection, mood, accent, texture and room. By default ReaComfy installs ZONOS3 into its own Python 3.12 environment on first use and keeps it loaded in a background worker (no terminal, no server to launch); an external ZONOS3 server or venv can still be used.
 - `REAPER DBLM-SE (Generative Denoise + Dereverb)`: DBLM-SE-1B (Apache-2.0) generative speech restoration (16 kHz output), chunked for long files.
+- Missing Python modules for the new nodes are installed automatically into ComfyUI's environment; model code and weights download on first use.
 - Example workflows `reaper_nemotron_reuse.json`, `reaper_zonos3_tts.json` and `reaper_dblm_se.json`.
 
 ## [0.5.3] - 2026-11-26

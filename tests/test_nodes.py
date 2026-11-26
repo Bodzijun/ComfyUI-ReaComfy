@@ -1,3 +1,4 @@
+import json
 import sys
 import types
 from pathlib import Path
@@ -228,7 +229,7 @@ def test_zonos3_server_backend(nodes):
         reference = {"waveform": torch.randn(1, 2, 48000) * 0.1, "sample_rate": 48000}
         audio, info = nodes.ReaperZonos3TTS().speak(
             "Перший рядок.\nДругий рядок.", language="uk", emotion="happy",
-            pace=0.5, seed=42, reference_audio=reference, gap_ms=100,
+            pace=0.5, seed=42, reference_audio=reference, gap_ms=100, backend="server",
             server_url=f"http://127.0.0.1:{server.server_port}",
         )
     finally:
@@ -370,3 +371,54 @@ def test_isolated_import_beats_regular_package_elsewhere(nodes, tmp_path, monkey
     assert VALUE == "repo" and Mamba == "fallback"
     assert "models" not in sys.modules or getattr(sys.modules["models"], "OWNER", None) != "repo"
     assert sys.modules.get("mamba_ssm") is not shim
+
+
+def test_ensure_modules_installs_only_missing(nodes, monkeypatch):
+    import subprocess
+
+    calls = []
+
+    class Done:
+        returncode, stdout, stderr = 0, "", ""
+
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: calls.append(cmd) or Done())
+    nodes._ensure_modules({"json": "json-pkg", "reacomfy_not_a_module_xyz": "fake-pkg==1"}, "test")
+    assert len(calls) == 1
+    assert calls[0][:4] == [sys.executable, "-m", "pip", "install"]
+    assert calls[0][-1] == "fake-pkg==1" and "json-pkg" not in calls[0]
+    calls.clear()
+    nodes._ensure_modules({"json": "json-pkg"}, "test")
+    assert calls == []
+
+
+FAKE_ZONOS3_WORKER = r"""
+import json, sys, wave
+print("loading weights...", flush=True)  # noise the protocol must ignore
+sys.stdout.write("@@REACOMFY " + json.dumps({"ready": True}) + "\n"); sys.stdout.flush()
+for line in sys.stdin:
+    job = json.loads(line)
+    with wave.open(job["out"], "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(44100)
+        w.writeframes(b"\x00\x10" * len(job["request"]["text"]))
+    sys.stdout.write("@@REACOMFY " + json.dumps({"ok": True, "seed": 99}) + "\n"); sys.stdout.flush()
+"""
+
+
+def test_zonos3_managed_worker_protocol(nodes, monkeypatch, tmp_path):
+    base = tmp_path / "zonos3"
+    base.mkdir()
+    (base / "reacomfy_zonos3_worker.py").write_text(FAKE_ZONOS3_WORKER, encoding="utf-8")
+    runtime = nodes._Zonos3Runtime
+    monkeypatch.setattr(runtime, "base", staticmethod(lambda: base))
+    monkeypatch.setattr(runtime, "python", classmethod(lambda cls: Path(sys.executable)))
+    monkeypatch.setattr(runtime, "ensure_installed", classmethod(lambda cls: tmp_path))
+    try:
+        audio, info = nodes.ReaperZonos3TTS().speak("Раз\nДва три", gap_ms=0, device="cpu", timeout_s=60)
+        first = runtime.process
+        nodes.ReaperZonos3TTS().speak("Ще", device="cpu", timeout_s=60)
+        assert runtime.process is first  # the model stays loaded between runs
+    finally:
+        runtime.stop()
+    assert audio["sample_rate"] == 44100
+    assert audio["waveform"].shape == (1, 1, len("Раз") + len("Два три"))
+    assert json.loads(info)["seeds"] == ["99", "99"]

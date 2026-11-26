@@ -120,15 +120,10 @@ the source rate (8–48 kHz) while keeping the main speaker. The research
 variants `nvidia/RE-USE` and `nvidia/Real-time_RE-USE` are non-commercial and
 are not used here.
 
-The code and weights (~40 MB) download on first use into
-`ComfyUI/models/nemotron_reuse/`. Extra modules (most ComfyUI installs already
-have them):
-
-```bash
-python -m pip install huggingface_hub einops pyyaml safetensors
-# optional, Linux + CUDA only, faster:
-python -m pip install mamba-ssm
-```
+Everything is automatic: the code and weights (~40 MB) download on first use
+into `ComfyUI/models/nemotron_reuse/`, and missing Python modules (`einops`,
+`pyyaml`, `safetensors`, `huggingface_hub`) are installed into ComfyUI's own
+Python. `mamba-ssm` (Linux + CUDA only) is used when it is already installed.
 
 Without `mamba-ssm` (Windows, macOS, CPU) the node uses a built-in PyTorch
 version of the Mamba scan: same weights and maths, slower. On an NVIDIA GPU
@@ -162,25 +157,18 @@ character presets; and `extra_controls` for raw bundle doses as JSON. Each line
 of the text is generated separately (`split`) and joined with `gap_ms` of
 silence. Output is 44.1 kHz mono; `info` returns the seeds used.
 
-ZONOS3 pins its own Python 3.12 / PyTorch stack, so the node does not install
-it into ComfyUI. It talks to ZONOS3 in one of two ways:
+Nothing to install or launch: with `backend = automatic` (default) the first
+run builds a private ZONOS3 environment in `ComfyUI/models/zonos3/` (its own
+Python 3.12 and PyTorch via `uv`, the ZONOS3 code and ~9 GB of weights; 10–30
+minutes, progress in `setup.log`). ZONOS3 pins its own Python/PyTorch versions,
+so it never touches ComfyUI's environment. After that the model stays loaded in
+a background worker and each line takes seconds. Reference audio is decoded
+without FFmpeg.
 
-1. **`server` (recommended):** run a ZONOS3 server and keep it open; the model
-   stays loaded. From a checkout of https://github.com/Zyphra/ZONOS3:
-   - Linux + NVIDIA: `uv sync --locked --all-packages`, then
-     `servers/sgl/scripts/serve.sh`;
-   - Apple Silicon: `uv sync --locked --package zonos3-mlx`, download the GGUF
-     files and run `servers/mlx/scripts/serve.sh`;
-   - Windows / CPU / Vulkan: build the C++ server in `servers/ggml`
-     (see its README) and start `zonos3-server`.
-   The default URL is `http://127.0.0.1:1919`.
-2. **`reference (venv)`:** runs `python -m zonos3.reference` from the ZONOS3
-   checkout for each line (reloads the model every time, slower). Set
-   `zonos3_home` / `zonos3_python` on the node or the `ZONOS3_HOME` /
-   `ZONOS3_PYTHON` environment variables.
-
-Steering controls need the steering bundle: the sgl server loads it by default;
-the GGUF servers need `gguf/steer.gguf` next to the backbone.
+Advanced alternatives: `server` talks to a ZONOS3 server you run yourself
+(default `http://127.0.0.1:1919`); `reference (venv)` runs `zonos3.reference`
+from your own checkout (`zonos3_home` / `zonos3_python` or `ZONOS3_HOME` /
+`ZONOS3_PYTHON`).
 
 ### DBLM-SE-1B
 
@@ -192,17 +180,12 @@ resynthesized at **16 kHz**: chain `REAPER ClearVoice Super Resolution` or
 `REAPER LavaSR v2` after it for full band. A CUDA GPU with about 8 GB or more
 is recommended.
 
-The DBLM-SE code (Apache-2.0) downloads automatically on first use into
-`ComfyUI/models/dblm_se/DBLM-SE/` (or `git clone https://github.com/Yorch233/DBLM-SE`
-there yourself). Install its extra modules once. Do **not** use DBLM-SE's own
-`requirements.txt`: it pins an old PyTorch that would break ComfyUI.
-
-```bash
-python -m pip install einops tabulate accelerate vector-quantize-pytorch transformers pyyaml
-```
-
-`torchtune` is optional: when it is missing, ReaComfy uses an identical built-in
-rotary-embedding module instead.
+Everything is automatic: the DBLM-SE code (Apache-2.0) downloads into
+`ComfyUI/models/dblm_se/DBLM-SE/` and its extra modules (`einops`, `tabulate`,
+`accelerate`, `vector-quantize-pytorch`, `transformers`, `pyyaml`) are installed
+into ComfyUI's Python on first use. DBLM-SE's own `requirements.txt` (which pins
+an old PyTorch) is never used, and `torchtune` is replaced by an identical
+built-in rotary-embedding module.
 
 `DBLM_SE_REPO` can point to another checkout. The weights (~11 GB: model,
 WavLM-Large, w2v-BERT and XCodec2) download on first use into
