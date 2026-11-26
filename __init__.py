@@ -6,7 +6,7 @@ write ``reaper_to_comfy.json`` with an input path; REAPER Output writes a
 ``comfy_to_reaper.json`` manifest and an audio file for the import action.
 """
 
-__version__ = "0.5.3"
+__version__ = "0.6.0"
 
 if __package__:  # skipped only when pytest walks the repository root
     from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS

@@ -2531,6 +2531,1885 @@ class ReaperChordsOnlyToABC:
         return ("\n".join(output),)
 
 
+def _models_subdir(name):
+    """Return ComfyUI/models/<name> (or ~/.cache/reacomfy/<name> outside ComfyUI)."""
+    try:
+        import folder_paths
+
+        base = Path(folder_paths.models_dir) / name
+    except Exception:
+        base = Path.home() / ".cache" / "reacomfy" / name
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _hf_snapshot(repo_id, local_dir, allow_patterns=None):
+    """Download a Hugging Face repo once into local_dir and return its path."""
+    local_dir = Path(local_dir)
+    marker = local_dir / ".reacomfy_complete"
+    if marker.is_file():
+        return local_dir
+    _ensure_modules({"huggingface_hub": "huggingface_hub"}, "model downloads")
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(
+        repo_id=repo_id, local_dir=str(local_dir), allow_patterns=allow_patterns
+    )
+    marker.write_text(repo_id, encoding="utf-8")
+    return local_dir
+
+
+def _resolve_device(device):
+    if device and device != "auto":
+        return device
+    if torch.cuda.is_available():
+        return "cuda"
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _interrupt_checker():
+    try:
+        import comfy.model_management as model_management
+
+        return model_management.throw_exception_if_processing_interrupted
+    except Exception:
+        return lambda: None
+
+
+def _resample(waveform, source_rate, target_rate):
+    """Resample [..., T] audio with torchaudio, falling back to linear interpolation."""
+    source_rate, target_rate = int(source_rate), int(target_rate)
+    if source_rate == target_rate:
+        return waveform
+    try:
+        import torchaudio.functional as AF
+
+        return AF.resample(waveform, source_rate, target_rate)
+    except Exception:
+        shape = waveform.shape
+        flat = waveform.reshape(1, -1, shape[-1])
+        size = max(1, round(shape[-1] * target_rate / source_rate))
+        out = torch.nn.functional.interpolate(
+            flat, size=size, mode="linear", align_corners=False
+        )
+        return out.reshape(*shape[:-1], size)
+
+
+def _overlap_chunks(total, chunk, overlap):
+    """Yield (start, end) windows of `chunk` samples that overlap by `overlap`."""
+    if total <= chunk:
+        yield 0, total
+        return
+    hop = max(1, chunk - overlap)
+    start = 0
+    while True:
+        end = min(total, start + chunk)
+        yield start, end
+        if end >= total:
+            return
+        start += hop
+
+
+def _process_in_chunks(signal, sample_rate, chunk_seconds, overlap_seconds, fn):
+    """Run fn on overlapping chunks of a 1-D tensor and crossfade the results."""
+    total = signal.shape[-1]
+    if chunk_seconds <= 0:
+        out = fn(signal)
+        return _fit_length(out, total)
+    chunk = max(1, int(chunk_seconds * sample_rate))
+    overlap = min(int(overlap_seconds * sample_rate), chunk // 2)
+    result = torch.zeros(total, dtype=torch.float32)
+    weight = torch.zeros(total, dtype=torch.float32)
+    check_interrupt = _interrupt_checker()
+    for start, end in _overlap_chunks(total, chunk, overlap):
+        check_interrupt()
+        piece = _fit_length(fn(signal[start:end]), end - start)
+        window = torch.ones(end - start)
+        if overlap > 0:
+            ramp = torch.linspace(0.0, 1.0, overlap + 2)[1:-1]
+            if start > 0:
+                window[:overlap] = ramp[: min(overlap, end - start)]
+            if end < total:
+                n = min(overlap, end - start)
+                window[-n:] = torch.minimum(window[-n:], ramp.flip(0)[-n:])
+        result[start:end] += piece * window
+        weight[start:end] += window
+    return result / weight.clamp_min(1e-6)
+
+
+def _fit_length(samples, length):
+    samples = torch.as_tensor(samples).detach().float().cpu().reshape(-1)
+    if samples.shape[-1] >= length:
+        return samples[:length]
+    return torch.nn.functional.pad(samples, (0, length - samples.shape[-1]))
+
+
+def _ensure_modules(requirements, purpose, upgrade=False):
+    """Install missing Python modules into ComfyUI's own environment.
+
+    requirements: {import_name: pip_spec}. REAPER users should never need a
+    terminal, so missing optional modules are installed on first use with the
+    interpreter that runs ComfyUI (sys.executable). Installed packages that
+    are already satisfied (e.g. torch) are never upgraded unless upgrade=True
+    (used when an installed copy is present but broken).
+    """
+    import importlib
+    import subprocess
+
+    def broken():
+        result = {}
+        for module, spec in requirements.items():
+            # "module:Name" also requires that attribute (catches stale versions).
+            module, _, attribute = module.partition(":")
+            try:
+                loaded = importlib.import_module(module)
+                if attribute:
+                    getattr(loaded, attribute)
+            except Exception as error:  # noqa: BLE001 - any failure means reinstall
+                for key in [
+                    k for k in sys.modules if k == module or k.startswith(module + ".")
+                ]:
+                    del sys.modules[key]
+                result[spec] = f"{type(error).__name__}: {error}"
+        return result
+
+    missing = broken()
+    if not missing:
+        return
+    for attempt in ((), ("--upgrade",)) if not upgrade else (("--upgrade",),):
+        print(
+            f"[ReaComfy] Installing modules for {purpose}: {' '.join(missing)}"
+            + (" (upgrade)" if attempt else "")
+        )
+        command = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+        ]
+        completed = subprocess.run(
+            command + list(attempt) + list(missing),
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+        if completed.returncode != 0:
+            tail = (completed.stderr or completed.stdout or "")[-1500:]
+            raise RuntimeError(
+                f"ReaComfy could not install {', '.join(missing)} for {purpose}:\n{tail}"
+            )
+        importlib.invalidate_caches()
+        still = broken()
+        if not still:
+            return
+        missing = still
+    details = "\n".join(f"{spec}: {error}" for spec, error in missing.items())
+    raise RuntimeError(
+        f"{purpose}: these modules were installed but still fail to import in "
+        f"ComfyUI's Python ({sys.executable}):\n{details}\nRestart ComfyUI and run "
+        "the node again; if it persists, send this message to the ReaComfy thread."
+    )
+
+
+def _download_github_zip(owner_repo, target, marker):
+    """Download a GitHub repository's main branch as a zip into target."""
+    import io
+    import tempfile
+    import urllib.request
+    import zipfile
+
+    url = f"https://codeload.github.com/{owner_repo}/zip/refs/heads/main"
+    print(f"[ReaComfy] Downloading {owner_repo} code into {target}")
+    with urllib.request.urlopen(url, timeout=300) as response:
+        payload = response.read()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix="reacomfy_code_", dir=str(target.parent)))
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            archive.extractall(staging)
+        roots = [p for p in staging.iterdir() if p.is_dir()]
+        if len(roots) != 1 or not (roots[0] / marker).exists():
+            raise RuntimeError(f"Unexpected {owner_repo} archive layout")
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.move(str(roots[0]), str(target))
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# Managed ZONOS3 runtime: ZONOS3 pins Python 3.12 and its own torch, so
+# ReaComfy builds a private environment for it on first use (uv downloads
+# Python 3.12 itself) and keeps one worker process with the model loaded.
+# --------------------------------------------------------------------------
+
+ZONOS3_TORCH = ("torch==2.9.1", "torchaudio==2.9.1")
+ZONOS3_DEPS = [
+    "descript-audio-codec==1.0.0",
+    "transformers>=4.56.0,<=4.57.3",
+    "huggingface_hub",
+    "pyyaml",
+    "omegaconf",
+    "numpy",
+    "soundfile",
+    "tokenizers",
+    "kernels>=0.12.1",
+    "zyphra-textnorm==0.2.0",
+    "lmdb>=1.4",
+    "fastapi",
+    "pydantic>=2",
+    "pyicu-wheels>=2.14,<2.16",
+]
+ZONOS3_SETUP_VERSION = "1"
+ZONOS3_EDIT_VERSION = "1"
+
+ZONOS3_WINSHIM = r'''"""ReaComfy: stand-ins for Unix-only modules ZONOS3 imports (Windows only)."""
+import os
+import sys
+import types
+
+if os.name == "nt":
+    try:
+        import fcntl  # noqa: F401
+    except ImportError:
+        _fcntl = types.ModuleType("fcntl")
+        _fcntl.LOCK_SH, _fcntl.LOCK_EX, _fcntl.LOCK_NB, _fcntl.LOCK_UN = 1, 2, 4, 8
+        _fcntl.flock = lambda *args, **kwargs: None
+        _fcntl.lockf = lambda *args, **kwargs: None
+        sys.modules["fcntl"] = _fcntl
+    if not hasattr(os, "getuid"):
+        os.getuid = lambda: 0
+'''
+
+ZONOS3_WORKER = r'''
+"""ReaComfy's ZONOS3 worker: loads the model once, then serves requests.
+
+Protocol: one JSON object per stdin line {"request": GenerateRequest, "out": wav};
+answers are stdout lines starting with "@@REACOMFY " followed by JSON.
+"""
+import json
+import sys
+import traceback
+
+
+def say(payload):
+    sys.stdout.write("@@REACOMFY " + json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+
+def windows_shims(device):
+    """ZONOS3 imports a few Unix-only modules; make them harmless on Windows."""
+    import os
+    import types
+
+    try:
+        import fcntl  # noqa: F401
+    except ImportError:
+        fcntl = types.ModuleType("fcntl")
+        fcntl.LOCK_SH, fcntl.LOCK_EX, fcntl.LOCK_NB, fcntl.LOCK_UN = 1, 2, 4, 8
+        fcntl.flock = lambda *args, **kwargs: None
+        fcntl.lockf = lambda *args, **kwargs: None
+        sys.modules["fcntl"] = fcntl
+    if not hasattr(os, "getuid"):
+        os.getuid = lambda: 0
+    # The reference codec defaults to cuda:0; follow the device ReaComfy chose.
+    os.environ.setdefault(
+        "ZONOS3_AUDIO_CODEC_DEVICE", "cuda:0" if device == "cuda" else device
+    )
+
+
+EDIT_LORA = ("Zyphra/ZONOS3-Mini", "lm/zonos3_mini/edit_lora/z3m_omni3b_edit_lora.pt")
+
+
+def prepare_edit_adapter(folder):
+    """The speech-edit LoRA as an accent-adapter folder (edit.pt), downloaded once."""
+    import shutil
+    from pathlib import Path
+
+    from huggingface_hub import hf_hub_download
+
+    target = Path(folder) / "edit.pt"
+    if not target.is_file():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source = hf_hub_download(repo_id=EDIT_LORA[0], filename=EDIT_LORA[1])
+        shutil.copyfile(source, str(target) + ".part")
+        Path(str(target) + ".part").replace(target)
+    return str(Path(folder))
+
+
+class ReferenceEditEngine:
+    """zonos3.tts.edit_runtime.EditEngine on the reference (pure PyTorch) model."""
+
+    def __init__(self, lm, assets, device, adapter):
+        import torch
+
+        from zonos3.reference.accents import AccentState
+        from zonos3.reference.synth import _codec_hop, prompt_builder
+        from zonos3.tts.edit import edit_marker_rows
+        from zonos3.tts.edit_runtime import EditModel
+
+        self.lm, self.assets, self.device = lm, assets, torch.device(device)
+        c = lm.config
+        max_spans = 0
+        if c.span_end_id is not None:
+            spec = prompt_builder(lm).config.text_tokenizer_spec
+            max_spans = edit_marker_rows(c.text_extra_tokens, spec)
+        self.model = EditModel.from_config(c, hop=_codec_hop(lm), max_spans=max_spans)
+        self.accents = AccentState.for_model(lm, assets.accent_adapters[adapter], 1.0)
+
+    @staticmethod
+    def _wav(audio):
+        from zonos3.tts.audio import _decode_audio_bytes
+
+        return _decode_audio_bytes(audio)
+
+    async def decode_audio(self, audio):
+        import io
+
+        import soundfile as sf
+
+        data, rate = sf.read(io.BytesIO(audio), dtype="float32", always_2d=True)
+        return data.mean(axis=1), int(rate)
+
+    async def embed(self, audio):
+        import torch
+
+        c = self.lm.config
+        wav, rate = self._wav(audio)
+        encoder = self.assets.speaker_encoder(
+            c.speaker_embedding_codec, c.speaker_embedding_dim, self.device
+        )
+        with torch.inference_mode():
+            output = encoder(wav, rate)
+        for candidate in output if isinstance(output, tuple) else (output,):
+            candidate = candidate.squeeze(0).to(dtype=torch.float32, device="cpu")
+            if candidate.numel() == c.speaker_embedding_dim:
+                return candidate
+        raise ValueError("The speaker encoder returned an unexpected embedding size.")
+
+    async def encode(self, audio, max_seconds):
+        import numpy as np
+        import torch
+
+        from zonos3.tokenizer.dual_reference import encode_dual_reference
+
+        if self.device.type != "cuda":
+            raise ValueError("ZONOS3 speech editing needs an NVIDIA GPU (CUDA).")
+        wav, rate = self._wav(audio)
+        index = self.device.index if self.device.index is not None else torch.cuda.current_device()
+        codes = encode_dual_reference(
+            wav, rate, max_seconds=float(max_seconds), device=f"cuda:{index}"
+        )
+        return np.asarray(torch.as_tensor(codes).cpu(), dtype=np.int64)
+
+    async def check(self, target_text, doses, condition_buckets, condition_values, steer):
+        if doses:
+            raise ValueError("Steering controls are not supported for speech edits here.")
+        return set()
+
+    async def fill(self, job):
+        import numpy as np
+        import torch
+
+        from zonos3.reference.synth import EditLayout, edit_region
+
+        c = self.lm.config
+        request = {
+            "text": job.text,
+            "language": job.language,
+            "text_normalization": job.text_normalization,
+            "seed": job.seed,
+            "max_tokens": job.max_tokens,
+            **job.sampling,
+        }
+        if job.condition_buckets is not None:
+            request["condition_buckets"] = job.condition_buckets
+        if job.condition_values is not None:
+            request["condition_values"] = job.condition_values
+        embedding = None
+        if job.speaker_embedding is not None:
+            embedding = torch.as_tensor(job.speaker_embedding, dtype=torch.float32)
+            request["speaker_mode"] = "embedding"
+        layout = EditLayout(
+            torch.as_tensor(np.asarray(job.window_codes), dtype=torch.int64),
+            [[int(start), int(length)] for start, length in job.spans],
+            [torch.as_tensor(np.asarray(fill), dtype=torch.int64) for fill in job.fills],
+        )
+        rows, eos_frame = edit_region(
+            self.lm,
+            request,
+            assets=self.assets,
+            layout=layout,
+            min_frames=int(job.min_frames),
+            speaker_embedding=embedding,
+            accents=self.accents,
+            device=self.device,
+        )
+        if len(rows) > 1:
+            block = torch.stack([torch.as_tensor(r) for r in rows[:-1]])[:, : c.n_codebooks]
+        else:
+            block = torch.zeros((0, c.n_codebooks), dtype=torch.int64)
+        return np.asarray(block.cpu(), dtype=np.int64), -1 if eos_frame is None else int(eos_frame)
+
+    async def decode(self, codes, decoder):
+        import numpy as np
+
+        from zonos3.reference.synth import _codec_decode, output_gain
+        from zonos3.tts.audio import output_pcm
+
+        c = self.lm.config
+        pcm = _codec_decode(self.lm, self.assets, self.device, decoder)(np.asarray(codes))
+        return np.asarray(output_pcm(pcm, output_gain(c.audio_codec, None, decoder)), dtype=np.float32)
+
+
+def run_edit(engine, state, job):
+    """One /v2/edit on the reference model; writes take 0 to job["out"]."""
+    import asyncio
+    import base64
+
+    from zonos3.server import schemas as S
+    from zonos3.tts import edit_align
+    from zonos3.tts.edit_runtime import EditRuntime
+
+    if "aligner" not in state:
+        aligner = None
+        if edit_align.fusealign_installed():
+            # ZONOS3 starts its helper workers with HF_HUB_OFFLINE=1, so fetch the
+            # FuseAlign checkpoint here (once, ~1.3 GB) and hand over the local file.
+            from fusealign_hub.aligner import CHECKPOINT_FILE, HF_REPO
+            from huggingface_hub import hf_hub_download
+
+            checkpoint = hf_hub_download(repo_id=HF_REPO, filename=CHECKPOINT_FILE)
+            aligner = edit_align.FuseAlignWorker(checkpoint=checkpoint)
+        state["aligner"] = aligner
+    request = dict(job["edit"])
+    if state["aligner"] is None:
+        if request.get("spans") is None:
+            raise ValueError("FuseAlign is not installed: set the edit region (start/end).")
+        request.pop("original_text", None)
+    runtime = EditRuntime(engine, None, state["aligner"])
+    result = asyncio.run(runtime.edit(S.EditRequest.model_validate(request)))
+    take = result["takes"][0]
+    with open(job["out"], "wb") as handle:
+        handle.write(base64.b64decode(take["audio_base64"]))
+    info = {key: result.get(key) for key in ("spans", "original_text", "expected_seconds")}
+    info.update({key: take.get(key) for key in ("edited_regions", "fill_seconds", "stopped")})
+    return take["seed"], info
+
+
+def main():
+    device, dtype_name, bundle = sys.argv[1], sys.argv[2], sys.argv[3]
+    edit_folder = sys.argv[4] if len(sys.argv) > 4 else ""
+    windows_shims(device)
+    import io
+    import wave
+
+    import soundfile as sf
+    import torch
+
+    import zonos3.tts.audio as zaudio
+    from zonos3.generation import SAMPLE_RATE
+    from zonos3.reference.lm import Zonos3LM
+    from zonos3.reference.synth import ReferenceAssets, synthesize
+    from zonos3.tts.audio import write_pcm16_wav
+    from zonos3.utils import release
+
+    original = zaudio._transcode_audio_bytes_to_wav
+
+    def to_wav(audio_bytes):
+        # ReaComfy sends PCM WAV; decode it without needing ffmpeg.
+        try:
+            data, rate = sf.read(io.BytesIO(audio_bytes), dtype="int16", always_2d=True)
+        except Exception:
+            return original(audio_bytes)
+        out = io.BytesIO()
+        with wave.open(out, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(rate)
+            handle.writeframes(data.mean(axis=1).astype("int16").tobytes())
+        return out.getvalue()
+
+    zaudio._transcode_audio_bytes_to_wav = to_wav
+    dtype = torch.bfloat16 if dtype_name == "bf16" else torch.float32
+    lm = Zonos3LM.load(release.RELEASE_LM, device=torch.device(device), dtype=dtype)
+    adapters = prepare_edit_adapter(edit_folder) if edit_folder else None
+    assets = ReferenceAssets.load(
+        steer_bundle=bundle or None, accent_adapters=adapters, laci_heads={}
+    )
+    assets.grow(lm)
+    if release.RELEASE_TEXT_ROWS:
+        from zonos3.models.text_extra import TextExtraRows
+
+        lm.append_text_rows(TextExtraRows.load(release.RELEASE_TEXT_ROWS))
+    engine = ReferenceEditEngine(lm, assets, device, "edit") if adapters else None
+    edit_state = {}
+    say({"ready": True, "edit": engine is not None})
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            job = json.loads(line)
+            if "edit" in job:
+                if engine is None:
+                    raise RuntimeError("this ZONOS3 worker was started without speech editing")
+                seed, info = run_edit(engine, edit_state, job)
+                say({"ok": True, "seed": seed, "info": info})
+                continue
+            result = synthesize(lm, job["request"], assets=assets, device=torch.device(device), dtype=dtype)
+            write_pcm16_wav(job["out"], result.pcm, SAMPLE_RATE)
+            say({"ok": True, "seed": result.seed})
+        except Exception:
+            say({"ok": False, "error": traceback.format_exc()[-3000:]})
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        say({"ok": False, "fatal": True, "error": traceback.format_exc()[-3000:]})
+        raise
+'''
+
+
+class _Zonos3Runtime:
+    """Builds the private ZONOS3 environment and owns the worker process."""
+
+    process = None
+    process_key = None
+    process_edit = False
+
+    @staticmethod
+    def base():
+        return _models_subdir("zonos3")
+
+    @classmethod
+    def python(cls):
+        venv = cls.base() / "venv"
+        if os.name == "nt":
+            return venv / "Scripts" / "python.exe"
+        return venv / "bin" / "python"
+
+    @classmethod
+    def _run(cls, command, log, timeout=3600):
+        import subprocess
+
+        log.write("\n$ " + " ".join(str(c) for c in command) + "\n")
+        log.flush()
+        completed = subprocess.run(
+            [str(c) for c in command],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            cwd=str(cls.base()),
+        )
+        if completed.returncode != 0:
+            log.flush()
+            tail = Path(log.name).read_text(encoding="utf-8", errors="replace")[-2000:]
+            raise RuntimeError(f"ZONOS3 setup step failed:\n{tail}")
+
+    @classmethod
+    def torch_index(cls):
+        if sys.platform == "darwin":
+            return None
+        if torch.cuda.is_available():
+            return "https://download.pytorch.org/whl/cu128"
+        return "https://download.pytorch.org/whl/cpu"
+
+    @classmethod
+    def ensure_installed(cls):
+        base = cls.base()
+        home = base / "ZONOS3"
+        marker = base / f".setup_v{ZONOS3_SETUP_VERSION}"
+        if marker.is_file() and cls.python().is_file() and home.is_dir():
+            return home
+        print(
+            "[ReaComfy] First ZONOS3 run: preparing its own Python 3.12 environment "
+            "(several GB, can take 10-30 minutes). Progress: " + str(base / "setup.log")
+        )
+        if not (home / "model" / "pyproject.toml").is_file():
+            _download_github_zip("Zyphra/ZONOS3", home, "model/pyproject.toml")
+        _ensure_modules({"uv": "uv"}, "the ZONOS3 environment")
+        uv = [sys.executable, "-m", "uv"]
+        with open(base / "setup.log", "a", encoding="utf-8") as log:
+            if not cls.python().is_file():
+                cls._run(uv + ["venv", "--python", "3.12", str(base / "venv")], log)
+            pip = uv + ["pip", "install", "--python", str(cls.python())]
+            index = cls.torch_index()
+            torch_cmd = pip + list(ZONOS3_TORCH)
+            if index:
+                torch_cmd += ["--index-url", index]
+            cls._run(torch_cmd, log)
+            cls._run(pip + ZONOS3_DEPS, log)
+            # fusealign-hub (speech editing only) is not on PyPI: skip deps.
+            cls._run(pip + ["--no-deps", str(home / "model")], log)
+        (base / "reacomfy_zonos3_worker.py").write_text(ZONOS3_WORKER, encoding="utf-8")
+        marker.write_text("ok", encoding="utf-8")
+        return home
+
+    @classmethod
+    def site_packages(cls):
+        venv = cls.base() / "venv"
+        if os.name == "nt":
+            return venv / "Lib" / "site-packages"
+        found = sorted((venv / "lib").glob("python3*/site-packages"))
+        return found[0] if found else None
+
+    @classmethod
+    def install_windows_shim(cls):
+        """ZONOS3's helper processes (FuseAlign) import Unix-only fcntl too; a .pth
+        hook gives every interpreter of the private venv the same stand-ins."""
+        site = cls.site_packages()
+        if os.name != "nt" or site is None or not site.is_dir():
+            return
+        module = site / "reacomfy_winshim.py"
+        if not module.is_file() or module.read_text(encoding="utf-8") != ZONOS3_WINSHIM:
+            module.write_text(ZONOS3_WINSHIM, encoding="utf-8")
+        (site / "reacomfy_winshim.pth").write_text(
+            "import reacomfy_winshim\n", encoding="utf-8"
+        )
+
+    @classmethod
+    def ensure_edit_extras(cls):
+        """FuseAlign (word timings for automatic edits), installed on the first edit."""
+        base = cls.base()
+        marker = base / f".edit_v{ZONOS3_EDIT_VERSION}"
+        if marker.is_file():
+            return
+        print(
+            "[ReaComfy] First ZONOS3 speech edit: installing FuseAlign "
+            "(word alignment) and the speech-edit adapter. Progress: "
+            + str(base / "setup.log")
+        )
+        code = base / "fusealign-multilingual"
+        if not (code / "pyproject.toml").is_file():
+            _download_github_zip(
+                "Zyphra/fusealign-multilingual", code, "pyproject.toml"
+            )
+        _ensure_modules({"uv": "uv"}, "the ZONOS3 environment")
+        pip = [
+            sys.executable,
+            "-m",
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(cls.python()),
+        ]
+        with open(base / "setup.log", "a", encoding="utf-8") as log:
+            cls._run(pip + ["silero-vad>=6.2.3"], log)
+            cls._run(pip + ["--no-deps", str(code)], log)
+        marker.write_text("ok", encoding="utf-8")
+
+    @classmethod
+    def worker(cls, device, timeout, edit=False):
+        import subprocess
+
+        home = cls.ensure_installed()
+        if edit:
+            cls.ensure_edit_extras()
+        cls.install_windows_shim()
+        script = cls.base() / "reacomfy_zonos3_worker.py"
+        # Rewrite on every start so fixes in a new ReaComfy reach old installs.
+        if not script.is_file() or script.read_text(encoding="utf-8") != ZONOS3_WORKER:
+            script.write_text(ZONOS3_WORKER, encoding="utf-8")
+        device = _resolve_device(device)
+        dtype = "bf16" if device == "cuda" else "f32"
+        key = (device, dtype)
+        process = cls.process
+        if (
+            process is not None
+            and process.poll() is None
+            and cls.process_key == key
+            and (cls.process_edit or not edit)
+        ):
+            return process  # an edit-capable worker also serves plain TTS
+        cls.stop()
+        bundle = home / ZONOS3_BUNDLE
+        log = open(cls.base() / "worker.log", "a", encoding="utf-8")
+        print("[ReaComfy] Starting ZONOS3 (first start downloads ~9 GB of weights)")
+        process = subprocess.Popen(
+            [
+                str(cls.python()),
+                str(script),
+                device,
+                dtype,
+                str(bundle) if bundle.is_file() else "",
+                str(cls.base() / "edit_adapter") if edit else "",
+            ],
+            cwd=str(home),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=log,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+        )
+        cls.process, cls.process_key, cls.process_edit = process, key, edit
+        reply = cls._read(process, max(int(timeout), 7200))
+        if not reply.get("ready"):
+            cls.stop()
+            raise RuntimeError("ZONOS3 failed to start:\n" + reply.get("error", ""))
+        return process
+
+    @classmethod
+    def _read(cls, process, timeout):
+        import threading
+
+        result = {}
+
+        def reader():
+            for line in process.stdout:
+                if line.startswith("@@REACOMFY "):
+                    result.update(json.loads(line[len("@@REACOMFY ") :]))
+                    return
+
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        thread.join(timeout)
+        if thread.is_alive():
+            cls.stop()
+            raise RuntimeError(f"ZONOS3 did not answer within {timeout} s")
+        if not result:
+            log = cls.base() / "worker.log"
+            tail = (
+                log.read_text(encoding="utf-8", errors="replace")[-2000:]
+                if log.is_file()
+                else ""
+            )
+            cls.stop()
+            raise RuntimeError("ZONOS3 worker exited:\n" + tail)
+        return result
+
+    @classmethod
+    def generate(cls, request, device, timeout):
+        import tempfile
+
+        process = cls.worker(device, timeout)
+        out = Path(tempfile.mkdtemp(prefix="reacomfy_zonos3_")) / "out.wav"
+        try:
+            process.stdin.write(
+                json.dumps({"request": request, "out": str(out)}) + "\n"
+            )
+            process.stdin.flush()
+            reply = cls._read(process, timeout)
+            if not reply.get("ok"):
+                raise RuntimeError("ZONOS3 error:\n" + reply.get("error", ""))
+            samples, rate = sf.read(str(out), dtype="float32", always_2d=True)
+            return torch.from_numpy(samples.mean(axis=1)), int(rate), reply.get("seed")
+        finally:
+            shutil.rmtree(out.parent, ignore_errors=True)
+
+    @classmethod
+    def edit(cls, edit_request, device, timeout):
+        """Run a /v2/edit request; returns (mono float32 tensor, rate, seed, info)."""
+        import tempfile
+
+        process = cls.worker(device, timeout, edit=True)
+        out = Path(tempfile.mkdtemp(prefix="reacomfy_zonos3_edit_")) / "out.wav"
+        try:
+            process.stdin.write(
+                json.dumps({"edit": edit_request, "out": str(out)}) + "\n"
+            )
+            process.stdin.flush()
+            reply = cls._read(process, timeout)
+            if not reply.get("ok"):
+                raise RuntimeError("ZONOS3 edit error:\n" + reply.get("error", ""))
+            samples, rate = sf.read(str(out), dtype="float32", always_2d=True)
+            return (
+                torch.from_numpy(samples.mean(axis=1)),
+                int(rate),
+                reply.get("seed"),
+                reply.get("info") or {},
+            )
+        finally:
+            shutil.rmtree(out.parent, ignore_errors=True)
+
+    @classmethod
+    def stop(cls):
+        process, cls.process = cls.process, None
+        if process is not None and process.poll() is None:
+            try:
+                process.stdin.close()
+                process.wait(timeout=10)
+            except Exception:
+                process.kill()
+
+
+class _IsolatedImport:
+    """Import a checkout's generic top-level packages (e.g. src, library) without
+    clobbering same-named packages from other custom nodes."""
+
+    NAMES = ("src", "library")
+
+    def __init__(self, repo, names=None, modules=None):
+        self.repo = str(repo)
+        if names is not None:
+            self.NAMES = tuple(names)
+        self.modules = dict(modules or {})  # pre-bound stand-ins (e.g. mamba_ssm)
+
+    def _owned(self):
+        return {
+            key: module
+            for key, module in sys.modules.items()
+            if key.split(".")[0] in self.NAMES
+        }
+
+    def __enter__(self):
+        self.saved = self._owned()
+        for key in self.saved:
+            del sys.modules[key]
+        self.cwd = os.getcwd()
+        os.chdir(self.repo)  # some checkouts read configs relative to cwd
+        sys.path.insert(0, self.repo)
+        # Bind each top-level package to this checkout explicitly. Folders
+        # without __init__.py would otherwise lose to any regular package of
+        # the same name elsewhere on sys.path (common with many custom nodes).
+        import importlib.util
+        import types
+
+        sys.modules.update(self.modules)
+        for name in self.NAMES:
+            folder = Path(self.repo) / name
+            if not folder.is_dir():
+                continue
+            init = folder / "__init__.py"
+            if init.is_file():
+                spec = importlib.util.spec_from_file_location(
+                    name, init, submodule_search_locations=[str(folder)]
+                )
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[name] = module
+                spec.loader.exec_module(module)
+            else:
+                module = types.ModuleType(name)
+                module.__path__ = [str(folder)]
+                module.__package__ = name
+                sys.modules[name] = module
+        return self
+
+    def __exit__(self, *exc):
+        os.chdir(self.cwd)
+        try:
+            sys.path.remove(self.repo)
+        except ValueError:
+            pass
+        for key in self._owned():
+            del sys.modules[key]
+        sys.modules.update(self.saved)
+        return False
+
+
+# --------------------------------------------------------------------------
+# ZONOS3-Mini (Zyphra; code MIT, weights Apache-2.0): multilingual TTS with
+# voice cloning and steering controls (emotion, pace, accent, texture...).
+# The runtime pins its own Python 3.12 / torch stack, so ReaComfy talks to it
+# out of process: either a running ZONOS3 server (any backend, fastest) or
+# the plain-PyTorch reference in its own venv.
+# --------------------------------------------------------------------------
+
+ZONOS3_LANGUAGES = [
+    "uk", "en_us", "en_gb", "ru", "pl", "cs", "sk", "bg", "ro", "hu", "de",
+    "fr_fr", "es", "it", "pt_br", "nl", "da", "no", "sv", "fi", "el", "tr",
+    "he", "ar", "ka", "hi", "bn", "gu", "kn", "ml", "mr", "or", "pa", "ta",
+    "te", "ur", "id", "ms", "tl", "th", "vi", "ja", "ko", "cmn",
+]  # fmt: skip
+
+# Studio-bundle emotion controls and the doses Zyphra recommends for the
+# release LM ("angry and happy at x2-3, sad at x4-6, calm at x4, scared at x8,
+# confused at x2"). emotion_strength scales these.
+ZONOS3_EMOTIONS = {
+    "none": None,
+    "angry": ("emotions.angry", 2.5),
+    "happy": ("emotions.happy", 2.5),
+    "sad": ("emotions.sad", 5.0),
+    "calm": ("emotions.serene", 4.0),
+    "scared": ("emotions.scared", 8.0),
+    "confused": ("emotions.confused", 2.0),
+}
+
+ZONOS3_ACCENTS = {
+    "none": None,
+    "american": {"accents_en.american": 1.0},
+    "british": {"accents_en.british": 1.0},
+    "scottish": {"accents_en.scottish": 1.0},
+    "irish": {"accents_en.irish": 1.0},
+    "welsh": {"accents_en.welsh": 1.0},
+    "australian": {"accents_en.australian": 1.0},
+    "indian english": {"accents_en.indian": 1.0},
+    "hindi": {"accents_l1.hin": 1.0},
+    "spanish": {"accents_l1.spa": 1.0},
+    "french": {"accents_l1.fra": 1.0},
+    "portuguese": {"accents_l1.por": 1.0},
+    "german": {"accents_l1.deu": 1.0},
+    "vietnamese": {"accents_l1.vie": 1.0},
+    "polish": {"accents_l1.pol": 1.0},
+    "mandarin": {"mandarin.cmn": 1.0, "mandarin_hidden.cmn": 1.0 / 3.0},
+}
+
+# Bipolar studio sliders: (negative direction, positive direction).
+ZONOS3_BIPOLAR = {
+    "gender": ({"identity.gender": -1}, {"identity.gender": 1}),
+    "age": ({"identity.age": -1}, {"identity.age": 1}),
+    "pitch": ({"pitch.pitch": -1}, {"pitch.pitch": 1}),
+    "intonation": ({"pitch.pitch_range": -1}, {"pitch.pitch_range": 1}),
+    "room": ({"room.clean": -1}, {"room.clean": 1}),
+    "projection": ({"delivery.whisper": 1}, {"delivery.loud": 1}),
+    "pace": ({"delivery.tempo": -1}, {"delivery.tempo": 1}),
+    "chatty": ({"delivery.conversational": -1}, {"delivery.conversational": 1}),
+    "liveliness": ({"expressive.expressive": -1}, {"expressive.expressive": 1}),
+    "hesitation": ({"disfluency.disfluent": -1}, {"disfluency.disfluent": 1}),
+    "valence": ({"mood.valence": -1}, {"mood.valence": 1}),
+    "arousal": ({"mood.arousal": -1}, {"mood.arousal": 1}),
+}
+
+ZONOS3_TEXTURE = {
+    "deep": "texture.deep",
+    "bright": "texture.shrill",
+    "husky": "texture.husky",
+    "raspy": "texture.raspy",
+    "soft": "texture.soft",
+    "authority": "texture.authoritative",
+}
+
+ZONOS3_PRESETS = {
+    "none": {},
+    "BBC newsreader": {"accent": ("british", 1.5), "authority": 3, "room": 2},
+    "Elderly Scottish narrator": {
+        "age": 1.5,
+        "accent": ("scottish", 1.5),
+        "deep": 2,
+        "intonation": -1,
+    },
+    "Gravelly old man": {"gender": -1, "age": 2, "raspy": 3, "deep": 2},
+    "Chatty podcaster": {"chatty": 3, "room": 1, "liveliness": 4},
+    "Late-night radio": {"deep": 2, "room": 3, "pace": -0.8, "projection": -0.6},
+    "Phone call": {"room": -2},
+}
+
+ZONOS3_LM = "hf://Zyphra/ZONOS3-Mini/lm/zonos3_mini"
+ZONOS3_BUNDLE = "assets/steering/studio_bundle_mect60k_x10.json"
+
+
+def zonos3_controls(
+    sliders=None, texture=None, emotion="none", emotion_strength=1.0,
+    accent="none", accent_strength=1.0, preset="none", extra=None,
+):  # fmt: skip
+    """Translate ReaComfy sliders into ZONOS3 raw steering doses."""
+    sliders = dict(sliders or {})
+    texture = dict(texture or {})
+    preset_values = dict(ZONOS3_PRESETS.get(preset, {}))
+    preset_accent = preset_values.pop("accent", None)
+    for key, value in preset_values.items():
+        if key in ZONOS3_TEXTURE:
+            texture[key] = texture.get(key, 0.0) or value
+        else:
+            sliders[key] = sliders.get(key, 0.0) or value
+    controls = {}
+
+    def add(mapping, dose):
+        for direction, weight in mapping.items():
+            controls[direction] = controls.get(direction, 0.0) + weight * dose
+
+    for key, value in sliders.items():
+        value = float(value or 0.0)
+        if value == 0.0 or key not in ZONOS3_BIPOLAR:
+            continue
+        negative, positive = ZONOS3_BIPOLAR[key]
+        add(positive if value > 0 else negative, abs(value))
+    for key, value in texture.items():
+        value = float(value or 0.0)
+        if value > 0.0 and key in ZONOS3_TEXTURE:
+            add({ZONOS3_TEXTURE[key]: 1.0}, value)
+    if emotion in ZONOS3_EMOTIONS and ZONOS3_EMOTIONS[emotion] is not None:
+        direction, dose = ZONOS3_EMOTIONS[emotion]
+        if float(emotion_strength) > 0:
+            add({direction: 1.0}, dose * float(emotion_strength))
+    if accent == "none" and preset_accent:
+        accent, accent_strength = preset_accent
+    if ZONOS3_ACCENTS.get(accent) and float(accent_strength) > 0:
+        add(ZONOS3_ACCENTS[accent], float(accent_strength))
+    for direction, dose in (extra or {}).items():
+        add({str(direction): 1.0}, float(dose))
+    return {k: round(v, 4) for k, v in controls.items() if abs(v) > 1e-6}
+
+
+def zonos3_split_text(text, mode):
+    text = str(text or "").strip()
+    if not text:
+        return []
+    if mode == "whole text":
+        return [text]
+    if mode == "paragraphs":
+        parts = [p.strip() for p in text.replace("\r\n", "\n").split("\n\n")]
+    else:  # lines
+        parts = [p.strip() for p in text.replace("\r\n", "\n").split("\n")]
+    return [p for p in parts if p]
+
+
+def _zonos3_server_alive(server_url, timeout=2.0):
+    """True when something accepts connections at server_url's host:port."""
+    import socket
+    import urllib.parse
+
+    parsed = urllib.parse.urlparse(server_url or "")
+    host = parsed.hostname
+    if not host:
+        return False
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _zonos3_effective_backend(backend, server_url, zonos3_python, zonos3_home):
+    """Fall back to the managed runtime when the chosen backend is not set up.
+
+    Workflows saved with an older ReaComfy keep backend="server"; REAPER
+    users should not have to find that widget, so an unreachable server or a
+    reference backend without paths quietly uses the automatic install.
+    """
+    if backend == "server" and not _zonos3_server_alive(server_url):
+        print(
+            f"[ReaComfy] No ZONOS3 server at {server_url}; using the automatic "
+            "ZONOS3 install instead."
+        )
+        return "automatic"
+    python = str(zonos3_python or "").strip() or os.environ.get("ZONOS3_PYTHON", "")
+    home = str(zonos3_home or "").strip() or os.environ.get("ZONOS3_HOME", "")
+    if backend == "reference (venv)" and not (python and home):
+        print(
+            "[ReaComfy] ZONOS3 reference paths are empty; using the automatic install."
+        )
+        return "automatic"
+    return backend
+
+
+def _zonos3_server_generate(url, request, token, timeout):
+    import urllib.error
+    import urllib.request
+
+    body = dict(request, stream=False, format="wav")
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url.rstrip("/") + "/v2/generate",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            payload = response.read()
+            seed = response.headers.get("X-Seed")
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", "replace")[:800]
+        raise RuntimeError(f"ZONOS3 server error {error.code}: {detail}") from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(
+            f"Cannot reach the ZONOS3 server at {url} ({error.reason}). Start it first "
+            "(see README: ZONOS3-Mini), or switch backend to 'reference (venv)'."
+        ) from error
+    import io
+
+    samples, rate = sf.read(io.BytesIO(payload), dtype="float32", always_2d=True)
+    return torch.from_numpy(samples.mean(axis=1)), int(rate), seed
+
+
+def _zonos3_reference_generate(python, home, request, device, dtype, timeout):
+    import subprocess
+    import tempfile
+
+    python = python or os.environ.get("ZONOS3_PYTHON", "")
+    home = home or os.environ.get("ZONOS3_HOME", "")
+    if not python or not home:
+        raise RuntimeError(
+            "The 'reference (venv)' backend needs the ZONOS3 checkout and its Python: "
+            "set zonos3_home / zonos3_python on the node, or the ZONOS3_HOME and "
+            "ZONOS3_PYTHON environment variables (see README: ZONOS3-Mini)."
+        )
+    workdir = Path(tempfile.mkdtemp(prefix="reacomfy_zonos3_"))
+    try:
+        request_file = workdir / "request.json"
+        output = workdir / "out.wav"
+        request_file.write_text(json.dumps(request), encoding="utf-8")
+        command = [
+            python, "-m", "zonos3.reference", "--model", ZONOS3_LM,
+            "--request", str(request_file), "-o", str(output),
+            "--dtype", dtype,
+        ]  # fmt: skip
+        if device != "auto":
+            command += ["--device", device]
+        bundle = Path(home) / ZONOS3_BUNDLE
+        if request.get("controls") and bundle.is_file():
+            command += ["--steer-bundle", str(bundle)]
+        completed = subprocess.run(
+            command, cwd=home, capture_output=True, text=True, timeout=timeout
+        )
+        if completed.returncode != 0 or not output.is_file():
+            tail = (completed.stderr or completed.stdout or "")[-1500:]
+            raise RuntimeError(f"ZONOS3 reference failed:\n{tail}")
+        samples, rate = sf.read(str(output), dtype="float32", always_2d=True)
+        seed = None
+        for token in (completed.stdout or "").split(","):
+            if token.strip().startswith("seed "):
+                seed = token.strip()[5:]
+        return torch.from_numpy(samples.mean(axis=1)), int(rate), seed
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+class ReaperZonos3TTS:
+    DESCRIPTION = (
+        "ZONOS3-Mini text-to-speech (Zyphra; code MIT, weights Apache-2.0, 43 languages "
+        "incl. Ukrainian). Clones the voice of the optional reference AUDIO (5-30 s of "
+        "clean speech, e.g. the selected REAPER item) and steers emotion, pace, "
+        "projection, accent, texture and room. Runs out of process: a ZONOS3 server "
+        "(fast) or the reference in its own Python venv. Output: 44.1 kHz mono."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        def bipolar(lo, hi, tip):
+            return (
+                "FLOAT",
+                {"default": 0.0, "min": lo, "max": hi, "step": 0.1, "tooltip": tip},
+            )
+
+        def unipolar(hi, tip):
+            return (
+                "FLOAT",
+                {"default": 0.0, "min": 0.0, "max": hi, "step": 0.1, "tooltip": tip},
+            )
+
+        return {
+            "required": {
+                "text": (
+                    "STRING",
+                    {"multiline": True, "default": "Привіт! Це тест голосу ZONOS3."},
+                ),
+                "language": (ZONOS3_LANGUAGES, {"default": "uk"}),
+                "backend": (
+                    ["automatic", "server", "reference (venv)"],
+                    {
+                        "default": "automatic",
+                        "tooltip": "automatic: ReaComfy installs ZONOS3 in its own environment on first use and keeps it loaded (nothing to set up). server: an existing ZONOS3 server. reference: zonos3.reference from your own venv.",
+                    },
+                ),
+                "emotion": (list(ZONOS3_EMOTIONS), {"default": "none"}),
+                "emotion_strength": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 2.0,
+                        "step": 0.05,
+                        "tooltip": "1.0 = Zyphra's recommended dose for the chosen emotion.",
+                    },
+                ),
+                "pace": bipolar(-2, 2, "slower <-> faster (-1 = x1.45 longer)."),
+                "projection": bipolar(-1.5, 2, "whisper <-> loud."),
+                "valence": bipolar(-4, 4, "Mood: negative <-> positive."),
+                "arousal": bipolar(-4, 4, "Mood: calm <-> excited."),
+                "accent": (list(ZONOS3_ACCENTS), {"default": "none"}),
+                "accent_strength": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05},
+                ),
+                "seed": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 4294967295,
+                        "tooltip": "0 = random. Keep a seed to get the same take again.",
+                    },
+                ),
+            },
+            "optional": {
+                "reference_audio": ("AUDIO",),
+                "speaker_id": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Server backend: a voice id from GET /v2/speakers, used when no reference_audio is connected.",
+                    },
+                ),
+                "preset": (list(ZONOS3_PRESETS), {"default": "none"}),
+                "chatty": bipolar(-4, 4, "careful reading <-> spontaneous."),
+                "liveliness": bipolar(-8, 8, "flat <-> lively intonation."),
+                "hesitation": bipolar(-8, 8, "fluent <-> hesitant."),
+                "gender": bipolar(-2, 2, "masculine <-> feminine (changes the voice)."),
+                "age": bipolar(-2, 2, "younger <-> older."),
+                "pitch": bipolar(-2, 2, "lower <-> higher."),
+                "intonation": bipolar(-2, 2, "monotone <-> varied."),
+                "room": bipolar(-2, 4, "phone <-> studio."),
+                "deep": unipolar(4, "Deeper, huskier."),
+                "bright": unipolar(4, "Shriller."),
+                "husky": unipolar(4, "Huskier."),
+                "raspy": unipolar(4, "Raspy (changes the voice the most)."),
+                "soft": unipolar(4, "Softer and quieter."),
+                "authority": unipolar(4, "More authoritative."),
+                "extra_controls": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "tooltip": 'Advanced: JSON of raw bundle doses, e.g. {"emotions.relieved": 3}.',
+                    },
+                ),
+                "split": (
+                    ["lines", "paragraphs", "whole text"],
+                    {
+                        "default": "lines",
+                        "tooltip": "Generate each line/paragraph separately (stable on long scripts) and join them.",
+                    },
+                ),
+                "gap_ms": ("INT", {"default": 350, "min": 0, "max": 5000, "step": 50}),
+                "temperature": (
+                    "FLOAT",
+                    {"default": 0.75, "min": 0.1, "max": 1.5, "step": 0.05},
+                ),
+                "speaker_cfg_scale": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 1.0,
+                        "max": 3.0,
+                        "step": 0.1,
+                        "tooltip": "Closer to the reference voice (>1 doubles compute). Cannot be combined with laci.",
+                    },
+                ),
+                "laci": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Alignment-guarded decoding: fewer skipped/repeated words (server needs LACI heads).",
+                    },
+                ),
+                "server_url": ("STRING", {"default": "http://127.0.0.1:1919"}),
+                "access_token": ("STRING", {"default": ""}),
+                "zonos3_home": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Reference backend: ZONOS3 checkout (or env ZONOS3_HOME).",
+                    },
+                ),
+                "zonos3_python": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "Reference backend: python of the ZONOS3 venv (or env ZONOS3_PYTHON).",
+                    },
+                ),
+                "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
+                "timeout_s": ("INT", {"default": 900, "min": 30, "max": 7200}),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO", "STRING")
+    RETURN_NAMES = ("audio", "info")
+    FUNCTION = "speak"
+    CATEGORY = "REAPER AI/Voice"
+
+    def build_request(self, text, language, controls, seed, kwargs, speaker):
+        request = {
+            "text": text,
+            "language": language,
+            "temperature": float(kwargs.get("temperature", 0.75)),
+        }
+        if int(seed) > 0:
+            request["seed"] = int(seed)
+        request.update(speaker)
+        if controls:
+            request["controls"] = controls
+            request["speaker_mode"] = "embedding"
+        cfg = float(kwargs.get("speaker_cfg_scale", 1.0))
+        if kwargs.get("laci"):
+            request["laci"] = True
+        elif cfg > 1.0:
+            request["speaker_cfg_scale"] = cfg
+        return request
+
+    def speak(
+        self,
+        text,
+        language="uk",
+        backend="automatic",
+        emotion="none",
+        emotion_strength=1.0,
+        pace=0.0,
+        projection=0.0,
+        valence=0.0,
+        arousal=0.0,
+        accent="none",
+        accent_strength=1.0,
+        seed=0,
+        reference_audio=None,
+        speaker_id="",
+        preset="none",
+        extra_controls="",
+        split="lines",
+        gap_ms=350,
+        server_url="http://127.0.0.1:1919",
+        access_token="",
+        zonos3_home="",
+        zonos3_python="",
+        device="auto",
+        timeout_s=900,
+        **kwargs,
+    ):
+        import base64
+        import io
+
+        parts = zonos3_split_text(text, split)
+        if not parts:
+            raise ValueError("REAPER ZONOS3 TTS: text is empty")
+        sliders = {
+            "pace": pace,
+            "projection": projection,
+            "valence": valence,
+            "arousal": arousal,
+        }
+        for key in ZONOS3_BIPOLAR:
+            if key in kwargs:
+                sliders[key] = kwargs[key]
+        texture = {key: kwargs.get(key, 0.0) for key in ZONOS3_TEXTURE}
+        extra = {}
+        if str(extra_controls or "").strip():
+            try:
+                extra = json.loads(extra_controls)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"extra_controls is not valid JSON: {error}"
+                ) from error
+            if not isinstance(extra, dict):
+                raise ValueError(
+                    'extra_controls must be a JSON object like {"emotions.relieved": 3}'
+                )
+        controls = zonos3_controls(
+            sliders, texture, emotion, emotion_strength, accent, accent_strength,
+            preset, extra,
+        )  # fmt: skip
+
+        speaker = {}
+        if reference_audio is not None and "waveform" in reference_audio:
+            ref = reference_audio["waveform"].detach().float().cpu()
+            ref = ref.reshape(-1, ref.shape[-1]).mean(dim=0)
+            ref_rate = int(reference_audio["sample_rate"])
+            ref = ref[: ref_rate * 60]  # the speaker encoder reads up to 60 s
+            buffer = io.BytesIO()
+            sf.write(buffer, ref.numpy(), ref_rate, format="WAV", subtype="PCM_16")
+            speaker["speaker_audio_base64"] = base64.b64encode(
+                buffer.getvalue()
+            ).decode("ascii")
+            speaker["speaker_audio_name"] = "reaper_reference.wav"
+        elif str(speaker_id or "").strip():
+            speaker["speaker_embedding_id"] = str(speaker_id).strip()
+
+        backend = _zonos3_effective_backend(
+            backend, server_url, zonos3_python, zonos3_home
+        )
+        check_interrupt = _interrupt_checker()
+        pieces, rate, seeds = [], 44100, []
+        dtype = "bf16" if _resolve_device(device) == "cuda" else "f32"
+        for part in parts:
+            check_interrupt()
+            request = self.build_request(
+                part, language, controls, seed, kwargs, speaker
+            )
+            if backend == "automatic":
+                samples, rate, used_seed = _Zonos3Runtime.generate(
+                    request, device, int(timeout_s)
+                )
+            elif backend == "server":
+                samples, rate, used_seed = _zonos3_server_generate(
+                    server_url, request, access_token, int(timeout_s)
+                )
+            else:
+                samples, rate, used_seed = _zonos3_reference_generate(
+                    zonos3_python, zonos3_home, request, device, dtype, int(timeout_s)
+                )
+            seeds.append(str(used_seed))
+            if pieces and int(gap_ms) > 0:
+                pieces.append(torch.zeros(int(rate * int(gap_ms) / 1000)))
+            pieces.append(samples)
+        audio_out = torch.cat(pieces).reshape(1, 1, -1)
+        info = json.dumps(
+            {
+                "language": language,
+                "segments": len(parts),
+                "seeds": seeds,
+                "controls": controls,
+                "voice": "reference"
+                if "speaker_audio_base64" in speaker
+                else (speaker_id or "default"),
+            },
+            ensure_ascii=False,
+        )
+        return ({"waveform": audio_out, "sample_rate": rate}, info)
+
+
+ZONOS3_EDIT_MAX_SECONDS = 150.0  # zonos3.generation.EDIT_MAX_SECONDS
+
+
+def zonos3_edit_request(
+    wav_base64,
+    corrected_text,
+    original_text,
+    language,
+    edit_start,
+    edit_end,
+    seed,
+    temperature,
+):
+    """The /v2/edit body for one clip (spans from edit_start/edit_end, else a word diff)."""
+    corrected = " ".join(str(corrected_text or "").split())
+    original = " ".join(str(original_text or "").split())
+    if not corrected:
+        raise ValueError("Type the corrected text: what the whole clip should say.")
+    request = {
+        "audio_base64": wav_base64,
+        "target_text": corrected,
+        "language": language,
+        "temperature": float(temperature),
+    }
+    if original:
+        request["original_text"] = original
+    if float(edit_start) >= 0 and float(edit_end) > float(edit_start):
+        request["spans"] = [[float(edit_start), float(edit_end)]]
+    elif not original:
+        raise ValueError(
+            "Tell ZONOS3 what to fix: type the original text (what was actually said), "
+            "or set the edit region start/end in seconds."
+        )
+    if int(seed) > 0:
+        request["seed"] = int(seed)
+    return request
+
+
+class ReaperZonos3SpeechEdit:
+    DESCRIPTION = (
+        "Fixes a slip of the tongue in recorded speech with ZONOS3-Mini speech editing: only "
+        "the changed words are regenerated in the speaker's own voice, every other frame of "
+        "the recording stays untouched. Give the corrected text of the whole clip plus either "
+        "the original text (the changed words are found automatically) or the edit region in "
+        "seconds. Keep clips short (one or two sentences). Needs an NVIDIA GPU; the first run "
+        "installs ZONOS3, FuseAlign and the edit adapter automatically."
+    )
+    CATEGORY = "REAPER AI/Voice"
+    RETURN_TYPES = ("AUDIO", "STRING")
+    RETURN_NAMES = ("audio", "info")
+    FUNCTION = "edit"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "corrected_text": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "",
+                        "tooltip": "What the WHOLE clip should say after the fix.",
+                    },
+                ),
+                "original_text": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "",
+                        "tooltip": "What the clip actually says now (with the slip). With it the changed words are found automatically.",
+                    },
+                ),
+                "language": (ZONOS3_LANGUAGES, {"default": "uk"}),
+            },
+            "optional": {
+                "edit_start": (
+                    "FLOAT",
+                    {
+                        "default": -1.0,
+                        "min": -1.0,
+                        "max": ZONOS3_EDIT_MAX_SECONDS,
+                        "step": 0.01,
+                        "tooltip": "Start of the part to regenerate, seconds from the clip start. -1 = find it from the texts.",
+                    },
+                ),
+                "edit_end": (
+                    "FLOAT",
+                    {
+                        "default": -1.0,
+                        "min": -1.0,
+                        "max": ZONOS3_EDIT_MAX_SECONDS,
+                        "step": 0.01,
+                        "tooltip": "End of the part to regenerate. -1 = find it from the texts.",
+                    },
+                ),
+                "seed": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 2**31 - 9,
+                        "tooltip": "0 = random. Change it for another take.",
+                    },
+                ),
+                "temperature": (
+                    "FLOAT",
+                    {"default": 0.75, "min": 0.1, "max": 1.5, "step": 0.05},
+                ),
+                "match_input_rate": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Return the clip at its original sample rate (ZONOS3 works at 44.1 kHz).",
+                    },
+                ),
+                "device": (["auto", "cuda"], {"default": "auto"}),
+                "timeout_s": ("INT", {"default": 1800, "min": 60, "max": 14400}),
+            },
+        }
+
+    def edit(
+        self,
+        audio,
+        corrected_text,
+        original_text,
+        language,
+        edit_start=-1.0,
+        edit_end=-1.0,
+        seed=0,
+        temperature=0.75,
+        match_input_rate=True,
+        device="auto",
+        timeout_s=1800,
+    ):
+        import base64
+        import io
+
+        waveform = audio["waveform"].detach().float().cpu()
+        rate = int(audio["sample_rate"])
+        mono = waveform.reshape(-1, waveform.shape[-1]).mean(dim=0)
+        seconds = mono.shape[-1] / rate
+        if seconds > ZONOS3_EDIT_MAX_SECONDS:
+            raise ValueError(
+                f"The clip is {seconds:.0f} s long; ZONOS3 edits clips up to "
+                f"{ZONOS3_EDIT_MAX_SECONDS:.0f} s. Split the item around the slip."
+            )
+        buffer = io.BytesIO()
+        sf.write(
+            buffer, mono.clamp(-1, 1).numpy(), rate, format="WAV", subtype="PCM_16"
+        )
+        request = zonos3_edit_request(
+            base64.b64encode(buffer.getvalue()).decode("ascii"),
+            corrected_text,
+            original_text,
+            language,
+            edit_start,
+            edit_end,
+            seed,
+            temperature,
+        )
+        samples, out_rate, used_seed, info = _Zonos3Runtime.edit(
+            request, device, int(timeout_s)
+        )
+        if match_input_rate and out_rate != rate:
+            samples = _resample(samples, out_rate, rate)
+            out_rate = rate
+        info = dict(info, seed=used_seed, language=language)
+        return (
+            {"waveform": samples.reshape(1, 1, -1), "sample_rate": out_rate},
+            json.dumps(info, ensure_ascii=False),
+        )
+
+
+# --------------------------------------------------------------------------
+# NVIDIA Nemotron RE-USE (OpenMDW-1.1, commercial use allowed): universal
+# speech enhancement (noise, reverb, clipping, codec, bandwidth) at 8-48 kHz.
+# The research variants nvidia/RE-USE and Real-time_RE-USE are non-commercial
+# and deliberately not offered here.
+# --------------------------------------------------------------------------
+
+REUSE_REPO = "nvidia/NVIDIA-NemotronLabs-RE-USE"
+_REUSE_CACHE = {}
+
+
+class _MambaFallback(torch.nn.Module):
+    """Pure-PyTorch Mamba (v1) with mamba_ssm's parameter names.
+
+    Used when the CUDA-only mamba_ssm package is missing (Windows, macOS, CPU).
+    Numerically the same selective scan as mamba_ssm's reference path, just
+    slower; the checkpoint loads unchanged.
+    """
+
+    def __init__(
+        self, d_model, d_state=16, d_conv=4, expand=2, dt_rank="auto",
+        conv_bias=True, bias=False, **_ignored,
+    ):  # fmt: skip
+        super().__init__()
+        import math
+
+        self.d_inner = int(expand * d_model)
+        self.d_state = d_state
+        self.dt_rank = math.ceil(d_model / 16) if dt_rank == "auto" else dt_rank
+        self.in_proj = torch.nn.Linear(d_model, self.d_inner * 2, bias=bias)
+        self.conv1d = torch.nn.Conv1d(
+            self.d_inner, self.d_inner, kernel_size=d_conv, groups=self.d_inner,
+            padding=d_conv - 1, bias=conv_bias,
+        )  # fmt: skip
+        self.x_proj = torch.nn.Linear(
+            self.d_inner, self.dt_rank + d_state * 2, bias=False
+        )
+        self.dt_proj = torch.nn.Linear(self.dt_rank, self.d_inner, bias=True)
+        a = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
+        self.A_log = torch.nn.Parameter(torch.log(a))
+        self.D = torch.nn.Parameter(torch.ones(self.d_inner))
+        self.out_proj = torch.nn.Linear(self.d_inner, d_model, bias=bias)
+
+    def forward(self, hidden_states):
+        batch, length, _ = hidden_states.shape
+        x, z = self.in_proj(hidden_states).chunk(2, dim=-1)
+        x = self.conv1d(x.transpose(1, 2))[..., :length].transpose(1, 2)
+        x = torch.nn.functional.silu(x)
+        dt, b, c = torch.split(
+            self.x_proj(x), [self.dt_rank, self.d_state, self.d_state], dim=-1
+        )
+        dt = torch.nn.functional.softplus(self.dt_proj(dt))  # [B, L, D]
+        a = -torch.exp(self.A_log.float())  # [D, N]
+        y = self._scan(x.float(), dt.float(), a, b.float(), c.float())
+        y = y + x.float() * self.D.float()
+        y = y.to(hidden_states.dtype) * torch.nn.functional.silu(z)
+        return self.out_proj(y)
+
+    @staticmethod
+    def _scan(x, dt, a, b, c):
+        """Exact selective scan, one step at a time (stable for any decay)."""
+        batch, length, dim = x.shape
+        state = x.new_zeros(batch, dim, a.shape[-1])
+        outputs = []
+        for t in range(length):
+            dt_t = dt[:, t, :, None]
+            state = (
+                torch.exp(dt_t * a) * state + dt_t * b[:, t, None, :] * x[:, t, :, None]
+            )
+            outputs.append((state * c[:, t, None, :]).sum(-1))
+        return torch.stack(outputs, dim=1)
+
+
+def _reuse_files():
+    root = _hf_snapshot(REUSE_REPO, _models_subdir("nemotron_reuse") / "RE-USE")
+    recipes = sorted((root / "recipes").glob("*.yaml"))
+    if not (root / "models").is_dir() or not recipes:
+        raise RuntimeError(
+            f"RE-USE download looks incomplete in {root}. Delete the folder and run again."
+        )
+    return root, recipes[0]
+
+
+def _load_reuse(device, backend):
+    key = (device, backend)
+    if key in _REUSE_CACHE:
+        return _REUSE_CACHE[key]
+    import types
+
+    _ensure_modules(
+        {
+            "einops": "einops",
+            "yaml": "pyyaml",
+            "safetensors": "safetensors",
+            "huggingface_hub": "huggingface_hub",
+        },
+        "Nemotron RE-USE",
+    )
+    import yaml
+    from safetensors.torch import load_file
+
+    root, recipe = _reuse_files()
+    cfg = yaml.safe_load(recipe.read_text(encoding="utf-8"))
+    use_native = backend == "mamba_ssm" or (backend == "auto" and device == "cuda")
+    native = None
+    if use_native:
+        try:
+            import mamba_ssm as native
+        except Exception:
+            if backend == "mamba_ssm":
+                raise RuntimeError(
+                    "mamba_ssm is not installed (Linux + CUDA only). Use mamba backend "
+                    "'pytorch' or install it: python -m pip install mamba-ssm"
+                )
+            native = None
+    shim = native or types.SimpleNamespace(Mamba=_MambaFallback)
+    importer = _IsolatedImport(
+        root, names=("models", "utils", "mamba_ssm"), modules={"mamba_ssm": shim}
+    )
+    with importer:
+        from models.generator_SEMamba_time_d4 import SEMamba
+        from models.stfts import mag_phase_istft, mag_phase_stft
+
+        model = SEMamba(cfg)
+    state = load_file(str(root / "model.safetensors"))
+    model.load_state_dict(state)
+    model.to(torch.device(device)).eval()
+    entry = (model, cfg, mag_phase_stft, mag_phase_istft, native is not None)
+    _REUSE_CACHE.clear()
+    _REUSE_CACHE[key] = entry
+    return entry
+
+
+def _make_even(value):
+    value = int(round(value))
+    return value if value % 2 == 0 else value + 1
+
+
+class ReaperNemotronReUSE:
+    DESCRIPTION = (
+        "NVIDIA Nemotron RE-USE universal speech enhancement (OpenMDW-1.1, commercial "
+        "use allowed): removes noise and reverb, repairs clipping, codec and packet-loss "
+        "damage at the source rate (8-48 kHz), keeps the main speaker. Optional bandwidth "
+        "extension. 9.6M params; weights (~40 MB) download on first use. Uses mamba_ssm on "
+        "Linux+CUDA, otherwise a slower built-in PyTorch path (fine on a GPU, very slow on CPU)."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "strength": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.05,
+                        "tooltip": "1.0 = fully enhanced; lower values blend the dry signal back in.",
+                    },
+                ),
+                "bandwidth_extension": (
+                    ["off", "32000", "44100", "48000"],
+                    {
+                        "default": "off",
+                        "tooltip": "Resample to this rate first so the model regenerates the missing highs (e.g. 8/16 kHz phone or Zoom audio).",
+                    },
+                ),
+                "channels": (
+                    ["per channel", "mono"],
+                    {"default": "per channel"},
+                ),
+            },
+            "optional": {
+                "chunk_seconds": (
+                    "FLOAT",
+                    {
+                        "default": 5.0,
+                        "min": 0.0,
+                        "max": 60.0,
+                        "step": 0.5,
+                        "tooltip": "NVIDIA's long-file recipe uses 5 s chunks with 50% overlap. 0 = whole file.",
+                    },
+                ),
+                "mamba_backend": (
+                    ["auto", "mamba_ssm", "pytorch"],
+                    {
+                        "default": "auto",
+                        "tooltip": "auto uses mamba_ssm when it is installed on CUDA, otherwise the portable PyTorch scan.",
+                    },
+                ),
+                "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
+                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO", "AUDIO")
+    RETURN_NAMES = ("speech", "removed")
+    FUNCTION = "enhance"
+    CATEGORY = "REAPER AI/Enhancement"
+
+    def enhance(
+        self,
+        audio,
+        strength=1.0,
+        bandwidth_extension="off",
+        channels="per channel",
+        chunk_seconds=5.0,
+        mamba_backend="auto",
+        device="auto",
+        keep_model_loaded=True,
+    ):
+        if audio is None or "waveform" not in audio:
+            raise ValueError("REAPER Nemotron RE-USE requires an AUDIO input")
+        waveform = audio["waveform"].detach().float().cpu()
+        sample_rate = int(audio["sample_rate"])
+        if waveform.ndim == 2:
+            waveform = waveform.unsqueeze(0)
+        if waveform.ndim != 3:
+            raise ValueError("Audio waveform must be [B,C,T]")
+        device = _resolve_device(device)
+        model, cfg, stft, istft, _native = _load_reuse(device, mamba_backend)
+        torch_device = torch.device(device)
+
+        work_rate = sample_rate
+        if bandwidth_extension != "off":
+            work_rate = int(bandwidth_extension)
+        work_rate = min(max(work_rate, 8000), 48000)
+        dry = waveform.mean(dim=1, keepdim=True) if channels == "mono" else waveform
+        dry = _resample(dry, sample_rate, work_rate)
+
+        stft_cfg = cfg["stft_cfg"]
+        base = stft_cfg["sampling_rate"]
+        n_fft = _make_even(stft_cfg["n_fft"] * work_rate // base)
+        hop = _make_even(stft_cfg["hop_size"] * work_rate // base)
+        win = _make_even(stft_cfg["win_size"] * work_rate // base)
+        compress = cfg["model_cfg"]["compress_factor"]
+
+        def run(chunk):
+            x = chunk.to(torch_device).reshape(1, -1)
+            with torch.no_grad():
+                mag, pha, _ = stft(
+                    x, n_fft=n_fft, hop_size=hop, win_size=win,
+                    compress_factor=compress, center=True, addeps=False,
+                )  # fmt: skip
+                amp, phase, _ = model(mag, pha)
+                # NVIDIA's fix for the "strange sweep artifact": silence frames
+                # whose decoded magnitude is mostly zero.
+                linear = torch.expm1(torch.relu(amp))
+                zero_portion = (linear == 0).sum(1) / linear.shape[1]
+                amp[:, :, (zero_portion > 0.5)[0]] = 0
+                out = istft(amp, phase, n_fft, hop, win, compress)
+            return out.float().cpu()
+
+        wet = torch.empty_like(dry)
+        try:
+            for b in range(dry.shape[0]):
+                for c in range(dry.shape[1]):
+                    wet[b, c] = _process_in_chunks(
+                        dry[b, c], work_rate, float(chunk_seconds),
+                        float(chunk_seconds) * 0.5, run,
+                    )  # fmt: skip
+        finally:
+            if not keep_model_loaded:
+                _REUSE_CACHE.clear()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        amount = float(strength)
+        speech = dry + amount * (wet - dry) if amount < 1.0 else wet
+        removed = dry - speech
+        return (
+            {"waveform": speech.contiguous(), "sample_rate": work_rate},
+            {"waveform": removed.contiguous(), "sample_rate": work_rate},
+        )
+
+
 NODE_CLASS_MAPPINGS = {
     "REAPERInput": ReaperInput,
     "REAPERReferenceInput": ReaperReferenceInput,
@@ -2553,6 +4432,9 @@ NODE_CLASS_MAPPINGS = {
     "REAPERTextOutput": ReaperTextOutput,
     "REAPERChordsToABC": ReaperChordsToABC,
     "REAPERChordsOnlyToABC": ReaperChordsOnlyToABC,
+    "REAPERNemotronReUSE": ReaperNemotronReUSE,
+    "REAPERZonos3TTS": ReaperZonos3TTS,
+    "REAPERZonos3SpeechEdit": ReaperZonos3SpeechEdit,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "REAPERInput": "REAPER Input",
@@ -2576,4 +4458,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "REAPERTextOutput": "REAPER Text Output (SRT / Notes / Markers)",
     "REAPERChordsToABC": "REAPER Chords → ABC",
     "REAPERChordsOnlyToABC": "REAPER Chords → ABC (Chord-only)",
+    "REAPERNemotronReUSE": "REAPER Nemotron RE-USE (Universal Speech Enhancement)",
+    "REAPERZonos3TTS": "REAPER ZONOS3 TTS (Voice Clone + Emotion/Accent)",
+    "REAPERZonos3SpeechEdit": "REAPER ZONOS3 Speech Edit (Fix a Slip of the Tongue)",
 }

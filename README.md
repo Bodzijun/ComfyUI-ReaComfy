@@ -1,4 +1,4 @@
-# ComfyUI-ReaComfy — REAPER Bridge nodes (ReaComfy 0.5.3)
+# ComfyUI-ReaComfy — REAPER Bridge nodes (ReaComfy 0.6.0)
 
 ComfyUI custom nodes that exchange audio, MIDI, text and video with the active
 REAPER project. They are the ComfyUI half of
@@ -109,6 +109,87 @@ synthesizes a new upper band and outputs 48 kHz. It does not preserve the
 original high-frequency samples. Use `MossFormer2_SR_48K` instead when the
 source already contains valuable full-band information. Project:
 https://github.com/ysharma3501/LavaSR
+
+### NVIDIA Nemotron RE-USE
+
+`REAPER Nemotron RE-USE (Universal Speech Enhancement)` uses
+[nvidia/NVIDIA-NemotronLabs-RE-USE](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-RE-USE)
+(OpenMDW-1.1, "ready for commercial use"). One small model (9.6M parameters)
+removes noise and reverb and repairs clipping, codec and packet-loss damage at
+the source rate (8–48 kHz) while keeping the main speaker. The research
+variants `nvidia/RE-USE` and `nvidia/Real-time_RE-USE` are non-commercial and
+are not used here.
+
+Everything is automatic: the code and weights (~40 MB) download on first use
+into `ComfyUI/models/nemotron_reuse/`, and missing Python modules (`einops`,
+`pyyaml`, `safetensors`, `huggingface_hub`) are installed into ComfyUI's own
+Python. `mamba-ssm` (Linux + CUDA only) is used when it is already installed.
+
+Without `mamba-ssm` (Windows, macOS, CPU) the node uses a built-in PyTorch
+version of the Mamba scan: same weights and maths, slower. On an NVIDIA GPU
+without `mamba-ssm` (e.g. Windows) expect several seconds per 5 s chunk; on
+CPU it takes minutes per chunk, so use it only for short clips.
+`mamba_backend` forces either path.
+
+- `strength` — 1.0 = fully enhanced; lower values blend the dry signal back in.
+- `bandwidth_extension` — resample to 32/44.1/48 kHz first so the model
+  regenerates the missing highs of phone/Zoom/16 kHz recordings.
+- `chunk_seconds` — NVIDIA's long-file recipe (5 s, 50 % overlap).
+- Outputs `speech` and `removed` (speech + removed = input).
+
+### ZONOS3-Mini TTS
+
+`REAPER ZONOS3 TTS (Voice Clone + Emotion/Accent)` speaks text with
+[Zyphra ZONOS3-Mini](https://huggingface.co/Zyphra/ZONOS3-Mini) (code MIT,
+weights Apache-2.0, 43 languages including Ukrainian and Russian). Connect a
+`reference_audio` (5–30 s of clean speech, for example the selected REAPER
+item) to clone that voice, or give a `speaker_id` from the server's default
+voices.
+
+Controls (Zyphra's studio steering bundle): emotion (angry, happy, sad, calm,
+scared, confused) with a strength where 1.0 is Zyphra's recommended dose; pace;
+projection (whisper ↔ loud); mood valence and arousal; read ↔ chatty; flat ↔
+lively; hesitation; accent (British, American, Scottish, Irish, Welsh,
+Australian, Indian English, Hindi, Spanish, French, Portuguese, German,
+Vietnamese, Polish, Mandarin) with strength; gender, age, pitch, intonation,
+room (phone ↔ studio); texture (deep, bright, husky, raspy, soft, authority);
+character presets; and `extra_controls` for raw bundle doses as JSON. Each line
+of the text is generated separately (`split`) and joined with `gap_ms` of
+silence. Output is 44.1 kHz mono; `info` returns the seeds used.
+
+Nothing to install or launch: with `backend = automatic` (default) the first
+run builds a private ZONOS3 environment in `ComfyUI/models/zonos3/` (its own
+Python 3.12 and PyTorch via `uv`, the ZONOS3 code and ~9 GB of weights; 10–30
+minutes, progress in `setup.log`). ZONOS3 pins its own Python/PyTorch versions,
+so it never touches ComfyUI's environment. After that the model stays loaded in
+a background worker and each line takes seconds. Reference audio is decoded
+without FFmpeg.
+
+Advanced alternatives: `server` talks to a ZONOS3 server you run yourself
+(default `http://127.0.0.1:1919`); `reference (venv)` runs `zonos3.reference`
+from your own checkout (`zonos3_home` / `zonos3_python` or `ZONOS3_HOME` /
+`ZONOS3_PYTHON`).
+
+### ZONOS3 Speech Edit (fix a slip of the tongue)
+
+`REAPER ZONOS3 Speech Edit (Fix a Slip of the Tongue)` regenerates only the
+changed words of a recorded clip in the speaker's own voice with ZONOS3-Mini's
+speech-edit adapter; every other codec frame of the recording is kept exactly.
+Give it the selected REAPER item (keep it short: one or two sentences), the
+`corrected_text` (what the whole clip should say) and either:
+
+- `original_text`: what the clip says now, slip included. FuseAlign finds the
+  words that differ and only those are regenerated; or
+- `edit_start` / `edit_end`: the part to regenerate, in seconds from the clip
+  start (useful when the aligner misplaces a word).
+
+`seed` 0 is random; change it for another take. The result is the whole clip
+with the fix, at the item's sample rate (`match_input_rate`). Clips longer than
+16 s are edited in windows around the change and need `original_text`.
+
+Everything installs itself on the first edit, inside the private ZONOS3
+environment: FuseAlign (Zyphra, Apache-2.0, ~1.3 GB checkpoint) and the
+speech-edit LoRA from `Zyphra/ZONOS3-Mini`. Needs an NVIDIA GPU.
 
 ### DeepFilterNet / Egregora
 
