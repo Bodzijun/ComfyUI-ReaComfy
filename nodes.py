@@ -2662,8 +2662,12 @@ def _ensure_modules(requirements, purpose, upgrade=False):
     def broken():
         result = {}
         for module, spec in requirements.items():
+            # "module:Name" also requires that attribute (catches stale versions).
+            module, _, attribute = module.partition(":")
             try:
-                importlib.import_module(module)
+                loaded = importlib.import_module(module)
+                if attribute:
+                    getattr(loaded, attribute)
             except Exception as error:  # noqa: BLE001 - any failure means reinstall
                 for key in [
                     k for k in sys.modules if k == module or k.startswith(module + ".")
@@ -3027,7 +3031,7 @@ DBLM_SE_MODULES = {
     "einops": "einops",
     "tabulate": "tabulate",
     "accelerate": "accelerate",
-    "vector_quantize_pytorch": "vector-quantize-pytorch",
+    "vector_quantize_pytorch:ResidualFSQ": "vector-quantize-pytorch>=1.14",
     "transformers": "transformers",
     "yaml": "pyyaml",
     "safetensors": "safetensors",
@@ -3238,10 +3242,15 @@ def _load_dblm(device, _retry=False):
             )
     except ImportError as error:
         top = (error.name or "").split(".")[0]
-        if top in DBLM_SE_MODULES and not _retry:
+        needed = {
+            key: spec
+            for key, spec in DBLM_SE_MODULES.items()
+            if key.split(":")[0] == top
+        }
+        if needed and not _retry:
             # Present but broken (e.g. a stale copy left by another node):
             # reinstall it with an upgrade and try once more.
-            _ensure_modules({top: DBLM_SE_MODULES[top]}, "DBLM-SE", upgrade=True)
+            _ensure_modules(needed, "DBLM-SE", upgrade=True)
             return _load_dblm(device, _retry=True)
         raise RuntimeError(
             f"DBLM-SE could not import its code: {type(error).__name__}: {error}. "
@@ -3526,6 +3535,46 @@ def zonos3_split_text(text, mode):
     else:  # lines
         parts = [p.strip() for p in text.replace("\r\n", "\n").split("\n")]
     return [p for p in parts if p]
+
+
+def _zonos3_server_alive(server_url, timeout=2.0):
+    """True when something accepts connections at server_url's host:port."""
+    import socket
+    import urllib.parse
+
+    parsed = urllib.parse.urlparse(server_url or "")
+    host = parsed.hostname
+    if not host:
+        return False
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _zonos3_effective_backend(backend, server_url, zonos3_python, zonos3_home):
+    """Fall back to the managed runtime when the chosen backend is not set up.
+
+    Workflows saved with an older ReaComfy keep backend="server"; REAPER
+    users should not have to find that widget, so an unreachable server or a
+    reference backend without paths quietly uses the automatic install.
+    """
+    if backend == "server" and not _zonos3_server_alive(server_url):
+        print(
+            f"[ReaComfy] No ZONOS3 server at {server_url}; using the automatic "
+            "ZONOS3 install instead."
+        )
+        return "automatic"
+    python = str(zonos3_python or "").strip() or os.environ.get("ZONOS3_PYTHON", "")
+    home = str(zonos3_home or "").strip() or os.environ.get("ZONOS3_HOME", "")
+    if backend == "reference (venv)" and not (python and home):
+        print(
+            "[ReaComfy] ZONOS3 reference paths are empty; using the automatic install."
+        )
+        return "automatic"
+    return backend
 
 
 def _zonos3_server_generate(url, request, token, timeout):
@@ -3852,6 +3901,9 @@ class ReaperZonos3TTS:
         elif str(speaker_id or "").strip():
             speaker["speaker_embedding_id"] = str(speaker_id).strip()
 
+        backend = _zonos3_effective_backend(
+            backend, server_url, zonos3_python, zonos3_home
+        )
         check_interrupt = _interrupt_checker()
         pieces, rate, seeds = [], 44100, []
         dtype = "bf16" if _resolve_device(device) == "cuda" else "f32"

@@ -44,7 +44,9 @@ def test_cache_dir_follows_project_pointer(nodes, tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     project_cache = tmp_path / "My Project" / "REAPER_AI_CACHE"
     (tmp_path / "REAPER_AI_CACHE").mkdir()
-    (tmp_path / "REAPER_AI_CACHE" / "current_project.txt").write_text(str(project_cache), encoding="utf-8")
+    (tmp_path / "REAPER_AI_CACHE" / "current_project.txt").write_text(
+        str(project_cache), encoding="utf-8"
+    )
     assert nodes.cache_dir() == project_cache
 
 
@@ -78,14 +80,22 @@ def test_voice_isolator_per_channel(nodes, fake_inworld):
     assert voice["waveform"].shape == (1, 2, 4800)
     assert voice["sample_rate"] == 44100
     assert torch.allclose(voice["waveform"], audio["waveform"] * 0.25)
-    assert torch.allclose(voice["waveform"] + background["waveform"], audio["waveform"], atol=1e-6)
+    assert torch.allclose(
+        voice["waveform"] + background["waveform"], audio["waveform"], atol=1e-6
+    )
     assert _FakeIsolator.calls == [("inworld/voice-isolator", None, "offline", 0)]
 
 
 def test_voice_isolator_strength_and_mono(nodes, fake_inworld):
     audio = {"waveform": torch.randn(1, 2, 960), "sample_rate": 48000}
     voice, background = nodes.ReaperVoiceIsolator().isolate(
-        audio, mode="streaming", strength=0.5, channels="mono", lookahead_ms="40", device="cpu")
+        audio,
+        mode="streaming",
+        strength=0.5,
+        channels="mono",
+        lookahead_ms="40",
+        device="cpu",
+    )
     dry = audio["waveform"].mean(dim=1, keepdim=True)
     assert voice["waveform"].shape == (1, 1, 960)
     assert torch.allclose(voice["waveform"], dry * 0.625, atol=1e-6)
@@ -108,7 +118,9 @@ def test_voice_isolator_missing_package(nodes, monkeypatch):
     monkeypatch.setitem(sys.modules, "inworld", None)
     monkeypatch.setitem(sys.modules, "inworld.voice_isolation", None)
     with pytest.raises(RuntimeError, match="inworld-voice-isolation"):
-        nodes.ReaperVoiceIsolator().isolate({"waveform": torch.zeros(1, 1, 480), "sample_rate": 48000})
+        nodes.ReaperVoiceIsolator().isolate(
+            {"waveform": torch.zeros(1, 1, 480), "sample_rate": 48000}
+        )
 
 
 # ---- 0.6.0 nodes: Nemotron RE-USE, ZONOS3, DBLM-SE ---------------------------
@@ -121,7 +133,10 @@ def _naive_selective_scan(x, dt, a, b, c):
         for d in range(dim):
             h = torch.zeros(a.shape[-1])
             for t in range(length):
-                h = torch.exp(dt[bi, t, d] * a[d]) * h + dt[bi, t, d] * b[bi, t] * x[bi, t, d]
+                h = (
+                    torch.exp(dt[bi, t, d] * a[d]) * h
+                    + dt[bi, t, d] * b[bi, t] * x[bi, t, d]
+                )
                 out[bi, t, d] = (h * c[bi, t]).sum()
     return out
 
@@ -139,8 +154,15 @@ def test_mamba_fallback_has_mamba_ssm_parameter_names(nodes):
     block = nodes._MambaFallback(d_model=64, d_state=16, d_conv=4, expand=4)
     names = set(dict(block.named_parameters()))
     assert names == {
-        "in_proj.weight", "conv1d.weight", "conv1d.bias", "x_proj.weight",
-        "dt_proj.weight", "dt_proj.bias", "A_log", "D", "out_proj.weight",
+        "in_proj.weight",
+        "conv1d.weight",
+        "conv1d.bias",
+        "x_proj.weight",
+        "dt_proj.weight",
+        "dt_proj.bias",
+        "A_log",
+        "D",
+        "out_proj.weight",
     }
     assert block.in_proj.weight.shape == (512, 64)
     assert block.x_proj.weight.shape == (4 + 32, 256)
@@ -174,7 +196,11 @@ def test_isolated_import_restores_modules(nodes, tmp_path, monkeypatch):
 def test_zonos3_controls_mapping(nodes):
     controls = nodes.zonos3_controls(
         {"pace": -1.0, "projection": -1.5, "valence": 2.0},
-        {"deep": 2.0}, "sad", 1.0, "polish", 1.2,
+        {"deep": 2.0},
+        "sad",
+        1.0,
+        "polish",
+        1.2,
     )
     assert controls == {
         "delivery.tempo": -1.0,
@@ -186,8 +212,14 @@ def test_zonos3_controls_mapping(nodes):
     }
     assert nodes.zonos3_controls() == {}
     preset = nodes.zonos3_controls(preset="BBC newsreader")
-    assert preset == {"accents_en.british": 1.5, "texture.authoritative": 3.0, "room.clean": 2.0}
-    assert nodes.zonos3_controls(extra={"emotions.relieved": 3}) == {"emotions.relieved": 3.0}
+    assert preset == {
+        "accents_en.british": 1.5,
+        "texture.authoritative": 3.0,
+        "room.clean": 2.0,
+    }
+    assert nodes.zonos3_controls(extra={"emotions.relieved": 3}) == {
+        "emotions.relieved": 3.0
+    }
 
 
 def test_zonos3_languages_include_ukrainian(nodes):
@@ -228,8 +260,14 @@ def test_zonos3_server_backend(nodes):
     try:
         reference = {"waveform": torch.randn(1, 2, 48000) * 0.1, "sample_rate": 48000}
         audio, info = nodes.ReaperZonos3TTS().speak(
-            "Перший рядок.\nДругий рядок.", language="uk", emotion="happy",
-            pace=0.5, seed=42, reference_audio=reference, gap_ms=100, backend="server",
+            "Перший рядок.\nДругий рядок.",
+            language="uk",
+            emotion="happy",
+            pace=0.5,
+            seed=42,
+            reference_audio=reference,
+            gap_ms=100,
+            backend="server",
             server_url=f"http://127.0.0.1:{server.server_port}",
         )
     finally:
@@ -246,11 +284,24 @@ def test_zonos3_server_backend(nodes):
     assert json.loads(info)["seeds"] == ["7", "7"]
 
 
-def test_zonos3_reference_backend_needs_paths(nodes, monkeypatch):
+def test_zonos3_unconfigured_backends_fall_back_to_automatic(nodes, monkeypatch):
     monkeypatch.delenv("ZONOS3_HOME", raising=False)
     monkeypatch.delenv("ZONOS3_PYTHON", raising=False)
+    calls = []
+
+    def fake_generate(request, device, timeout):
+        calls.append(request["text"])
+        return torch.zeros(441), 44100, 5
+
+    monkeypatch.setattr(nodes._Zonos3Runtime, "generate", staticmethod(fake_generate))
+    # Old workflows keep backend="server"; nothing listens on this port.
+    nodes.ReaperZonos3TTS().speak(
+        "Hi", backend="server", server_url="http://127.0.0.1:9"
+    )
+    nodes.ReaperZonos3TTS().speak("Yo", backend="reference (venv)")
+    assert calls == ["Hi", "Yo"]
     with pytest.raises(RuntimeError, match="ZONOS3_HOME"):
-        nodes.ReaperZonos3TTS().speak("Hi", backend="reference (venv)")
+        nodes._zonos3_reference_generate("", "", {}, "cpu", "f32", 5)
 
 
 def test_dblm_code_download_failure_explains_clone(nodes, monkeypatch, tmp_path):
@@ -262,8 +313,12 @@ def test_dblm_code_download_failure_explains_clone(nodes, monkeypatch, tmp_path)
 
     monkeypatch.setattr(nodes, "_download_dblm_code", offline)
     nodes._DBLM_CACHE.clear()
-    with pytest.raises(RuntimeError, match="git clone https://github.com/Yorch233/DBLM-SE"):
-        nodes.ReaperDBLMSE().enhance({"waveform": torch.zeros(1, 1, 1600), "sample_rate": 16000})
+    with pytest.raises(
+        RuntimeError, match="git clone https://github.com/Yorch233/DBLM-SE"
+    ):
+        nodes.ReaperDBLMSE().enhance(
+            {"waveform": torch.zeros(1, 1, 1600), "sample_rate": 16000}
+        )
 
 
 def test_dblm_code_auto_download(nodes, monkeypatch, tmp_path):
@@ -286,7 +341,9 @@ def test_dblm_code_auto_download(nodes, monkeypatch, tmp_path):
     monkeypatch.delenv("DBLM_SE_REPO", raising=False)
     (tmp_path / "dblm_se").mkdir()
     monkeypatch.setattr(nodes, "_models_subdir", lambda name: tmp_path / name)
-    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=0: Response(buffer.getvalue()))
+    monkeypatch.setattr(
+        urllib.request, "urlopen", lambda url, timeout=0: Response(buffer.getvalue())
+    )
     repo = nodes._dblm_code_dir()
     assert repo == tmp_path / "dblm_se" / "DBLM-SE"
     assert (repo / "src" / "modeling_dblm.py").is_file()
@@ -298,11 +355,18 @@ def test_rotary_standin_matches_complex_rotation(nodes):
     x = torch.randn(2, 5, 3, 8)  # [batch, seq, heads, head_dim]
     theta = 1.0 / (10_000 ** (torch.arange(0, 8, 2).float() / 8))
     angles = torch.arange(5).float()[:, None] * theta[None]
-    rotated = torch.view_as_complex(x.reshape(2, 5, 3, 4, 2).contiguous()) * torch.polar(
-        torch.ones_like(angles), angles)[None, :, None, :]
+    rotated = (
+        torch.view_as_complex(x.reshape(2, 5, 3, 4, 2).contiguous())
+        * torch.polar(torch.ones_like(angles), angles)[None, :, None, :]
+    )
     expected = torch.view_as_real(rotated).flatten(3)
     assert torch.allclose(rope(x), expected, atol=1e-5)
-    assert rope(torch.randn(1, 40, 1, 8)).shape == (1, 40, 1, 8)  # grows past max_seq_len
+    assert rope(torch.randn(1, 40, 1, 8)).shape == (
+        1,
+        40,
+        1,
+        8,
+    )  # grows past max_seq_len
 
 
 class _FakeSEMamba(torch.nn.Module):
@@ -318,17 +382,36 @@ def test_reuse_node_with_fake_model(nodes, monkeypatch):
     import math
 
     def stft(y, n_fft, hop_size, win_size, compress_factor, center=True, addeps=False):
-        spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size,
-                          window=torch.hann_window(win_size), center=center, return_complex=True)
+        spec = torch.stft(
+            y,
+            n_fft,
+            hop_length=hop_size,
+            win_length=win_size,
+            window=torch.hann_window(win_size),
+            center=center,
+            return_complex=True,
+        )
         return torch.log1p(spec.abs()), spec.angle(), None
 
     def istft(mag, pha, n_fft, hop_size, win_size, compress_factor):
         mag = torch.expm1(torch.relu(mag))
-        return torch.istft(torch.polar(mag, pha), n_fft, hop_length=hop_size,
-                           win_length=win_size, window=torch.hann_window(win_size))
+        return torch.istft(
+            torch.polar(mag, pha),
+            n_fft,
+            hop_length=hop_size,
+            win_length=win_size,
+            window=torch.hann_window(win_size),
+        )
 
-    cfg = {"stft_cfg": {"sampling_rate": 8000, "n_fft": 320, "hop_size": 40, "win_size": 320},
-           "model_cfg": {"compress_factor": "relu_log1p"}}
+    cfg = {
+        "stft_cfg": {
+            "sampling_rate": 8000,
+            "n_fft": 320,
+            "hop_size": 40,
+            "win_size": 320,
+        },
+        "model_cfg": {"compress_factor": "relu_log1p"},
+    }
     calls = []
 
     def fake_load(device, backend):
@@ -339,7 +422,8 @@ def test_reuse_node_with_fake_model(nodes, monkeypatch):
     t = torch.arange(48000) / 48000
     tone = (0.3 * torch.sin(2 * math.pi * 440 * t)).reshape(1, 1, -1).repeat(1, 2, 1)
     speech, removed = nodes.ReaperNemotronReUSE().enhance(
-        {"waveform": tone, "sample_rate": 48000}, chunk_seconds=0.5, device="cpu")
+        {"waveform": tone, "sample_rate": 48000}, chunk_seconds=0.5, device="cpu"
+    )
     assert calls == [("cpu", "auto")]
     assert speech["sample_rate"] == 48000 and speech["waveform"].shape == (1, 2, 48000)
     core = slice(2400, -2400)
@@ -347,7 +431,11 @@ def test_reuse_node_with_fake_model(nodes, monkeypatch):
     assert torch.allclose(speech["waveform"] + removed["waveform"], tone, atol=1e-6)
     bwe, _ = nodes.ReaperNemotronReUSE().enhance(
         {"waveform": tone[:, :1, :16000], "sample_rate": 16000},
-        bandwidth_extension="48000", channels="mono", chunk_seconds=0, device="cpu")
+        bandwidth_extension="48000",
+        channels="mono",
+        chunk_seconds=0,
+        device="cpu",
+    )
     assert bwe["sample_rate"] == 48000 and bwe["waveform"].shape == (1, 1, 48000)
 
 
@@ -365,11 +453,16 @@ def test_isolated_import_beats_regular_package_elsewhere(nodes, tmp_path, monkey
     )
     (repo / "models" / "helper.py").write_text("VALUE = 'repo'\n")
     shim = types.SimpleNamespace(Mamba="fallback")
-    with nodes._IsolatedImport(repo, names=("models", "mamba_ssm"), modules={"mamba_ssm": shim}):
+    with nodes._IsolatedImport(
+        repo, names=("models", "mamba_ssm"), modules={"mamba_ssm": shim}
+    ):
         from models.net import VALUE, Mamba
 
     assert VALUE == "repo" and Mamba == "fallback"
-    assert "models" not in sys.modules or getattr(sys.modules["models"], "OWNER", None) != "repo"
+    assert (
+        "models" not in sys.modules
+        or getattr(sys.modules["models"], "OWNER", None) != "repo"
+    )
     assert sys.modules.get("mamba_ssm") is not shim
 
 
@@ -381,7 +474,9 @@ def test_ensure_modules_installs_only_missing(nodes, monkeypatch):
     class Done:
         returncode, stdout, stderr = 0, "", ""
 
-    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: calls.append(cmd) or Done())
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: calls.append(cmd) or Done()
+    )
     # The fake package never becomes importable: one plain install, one
     # upgrade retry, then a clear error naming the module.
     with pytest.raises(RuntimeError, match="fake-pkg==1"):
@@ -413,13 +508,19 @@ for line in sys.stdin:
 def test_zonos3_managed_worker_protocol(nodes, monkeypatch, tmp_path):
     base = tmp_path / "zonos3"
     base.mkdir()
-    (base / "reacomfy_zonos3_worker.py").write_text(FAKE_ZONOS3_WORKER, encoding="utf-8")
+    (base / "reacomfy_zonos3_worker.py").write_text(
+        FAKE_ZONOS3_WORKER, encoding="utf-8"
+    )
     runtime = nodes._Zonos3Runtime
     monkeypatch.setattr(runtime, "base", staticmethod(lambda: base))
-    monkeypatch.setattr(runtime, "python", classmethod(lambda cls: Path(sys.executable)))
+    monkeypatch.setattr(
+        runtime, "python", classmethod(lambda cls: Path(sys.executable))
+    )
     monkeypatch.setattr(runtime, "ensure_installed", classmethod(lambda cls: tmp_path))
     try:
-        audio, info = nodes.ReaperZonos3TTS().speak("Раз\nДва три", gap_ms=0, device="cpu", timeout_s=60)
+        audio, info = nodes.ReaperZonos3TTS().speak(
+            "Раз\nДва три", gap_ms=0, device="cpu", timeout_s=60
+        )
         first = runtime.process
         nodes.ReaperZonos3TTS().speak("Ще", device="cpu", timeout_s=60)
         assert runtime.process is first  # the model stays loaded between runs
