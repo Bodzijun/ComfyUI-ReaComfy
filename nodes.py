@@ -2658,25 +2658,108 @@ def _fit_length(samples, length):
 _DBLM_CACHE = {}
 
 
+DBLM_SE_CODE_ZIP = "https://codeload.github.com/Yorch233/DBLM-SE/zip/refs/heads/main"
+DBLM_SE_DEPS = "einops tabulate accelerate vector-quantize-pytorch transformers pyyaml"
+
+
+def _download_dblm_code(target):
+    """Fetch the DBLM-SE code (Apache-2.0) as a zip from GitHub into target."""
+    import io
+    import tempfile
+    import urllib.request
+    import zipfile
+
+    print(f"[ReaComfy] Downloading DBLM-SE code into {target}")
+    with urllib.request.urlopen(DBLM_SE_CODE_ZIP, timeout=120) as response:
+        payload = response.read()
+    staging = Path(tempfile.mkdtemp(prefix="reacomfy_dblm_", dir=str(target.parent)))
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            archive.extractall(staging)
+        roots = [p for p in staging.iterdir() if p.is_dir()]
+        if len(roots) != 1 or not (roots[0] / "src" / "modeling_dblm.py").is_file():
+            raise RuntimeError("Unexpected DBLM-SE archive layout")
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.move(str(roots[0]), str(target))
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 def _dblm_code_dir():
     candidates = []
     configured = os.environ.get("DBLM_SE_REPO", "")
     if configured:
         candidates.append(Path(configured).expanduser())
-    candidates.append(_models_subdir("dblm_se") / "DBLM-SE")
+    default = _models_subdir("dblm_se") / "DBLM-SE"
+    candidates.append(default)
     candidates.append(Path(__file__).resolve().parent.parent / "DBLM-SE")
     for candidate in candidates:
         if (candidate / "src" / "modeling_dblm.py").is_file():
             return candidate
-    raise RuntimeError(
-        "DBLM-SE code was not found. Clone it once (it is Apache-2.0):\n"
-        f'  git clone https://github.com/Yorch233/DBLM-SE "{candidates[-2]}"\n'
-        "then install its extra modules into the ComfyUI environment WITHOUT its "
-        "pinned torch versions:\n"
-        "  python -m pip install einops tabulate accelerate vector-quantize-pytorch "
-        "torchtune torchao transformers pyyaml\n"
-        "Or set DBLM_SE_REPO to an existing checkout."
-    )
+    try:
+        _download_dblm_code(default)
+        return default
+    except Exception as error:
+        raise RuntimeError(
+            f"Could not download the DBLM-SE code ({error}). Clone it once "
+            "(it is Apache-2.0):\n"
+            f'  git clone https://github.com/Yorch233/DBLM-SE "{default}"\n'
+            "or set DBLM_SE_REPO to an existing checkout."
+        ) from error
+
+
+class _RotaryPositionalEmbeddings(torch.nn.Module):
+    """Same maths and buffer as torchtune.modules.RotaryPositionalEmbeddings.
+
+    XCodec2 only needs this one class from torchtune, which pins torch/torchao
+    versions that often clash with ComfyUI; it is used when torchtune is missing.
+    """
+
+    def __init__(self, dim, max_seq_len=4096, base=10_000):
+        super().__init__()
+        self.dim, self.base, self.max_seq_len = dim, base, max_seq_len
+        theta = 1.0 / (base ** (torch.arange(0, dim, 2)[: dim // 2].float() / dim))
+        self.register_buffer("theta", theta, persistent=False)
+        self._build(max_seq_len)
+
+    def _build(self, length):
+        seq = torch.arange(length, dtype=self.theta.dtype, device=self.theta.device)
+        angles = torch.einsum("i,j->ij", seq, self.theta).float()
+        cache = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)
+        self.register_buffer("cache", cache, persistent=False)
+
+    def forward(self, x, *, input_pos=None):
+        seq_len = x.size(1)
+        if input_pos is None and seq_len > self.cache.shape[0]:
+            self._build(seq_len)
+        rope = self.cache[:seq_len] if input_pos is None else self.cache[input_pos]
+        shaped = x.float().reshape(*x.shape[:-1], -1, 2)
+        rope = rope.view(-1, shaped.size(1), 1, shaped.size(3), 2)
+        out = torch.stack(
+            [
+                shaped[..., 0] * rope[..., 0] - shaped[..., 1] * rope[..., 1],
+                shaped[..., 1] * rope[..., 0] + shaped[..., 0] * rope[..., 1],
+            ],
+            -1,
+        )
+        return out.flatten(3).type_as(x)
+
+
+def _torchtune_standin():
+    try:
+        import torchtune.modules  # noqa: F401
+
+        return {}
+    except Exception:
+        import types
+
+        package = types.ModuleType("torchtune")
+        modules = types.ModuleType("torchtune.modules")
+        modules.RotaryPositionalEmbeddings = _RotaryPositionalEmbeddings
+        package.modules = modules
+        package.__path__ = []
+        return {"torchtune": package, "torchtune.modules": modules}
 
 
 class _IsolatedImport:
@@ -2760,7 +2843,10 @@ def _load_dblm(device):
         )
     torch_device = torch.device(device)
     try:
-        with _IsolatedImport(repo):
+        standin = _torchtune_standin()
+        with _IsolatedImport(
+            repo, names=("src", "library", *sorted(standin)), modules=standin
+        ):
             import library  # noqa: F401  registers WavLM and XCodec2
             from library.register import ModelRegister
             from safetensors.torch import load_file
@@ -2798,8 +2884,7 @@ def _load_dblm(device):
     except ImportError as error:
         raise RuntimeError(
             f"DBLM-SE needs an extra module ({error.name}). Install into the ComfyUI "
-            "environment: python -m pip install einops tabulate accelerate "
-            "vector-quantize-pytorch torchtune torchao transformers pyyaml"
+            f"environment: python -m pip install {DBLM_SE_DEPS}"
         ) from error
     _DBLM_CACHE.clear()
     _DBLM_CACHE[device] = (encoder, codec_model, model, sde)

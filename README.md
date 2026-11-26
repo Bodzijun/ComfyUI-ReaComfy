@@ -192,13 +192,17 @@ resynthesized at **16 kHz**: chain `REAPER ClearVoice Super Resolution` or
 `REAPER LavaSR v2` after it for full band. A CUDA GPU with about 8 GB or more
 is recommended.
 
-Install once (do **not** use DBLM-SE's own `requirements.txt`: it pins an old
-PyTorch that would break ComfyUI):
+The DBLM-SE code (Apache-2.0) downloads automatically on first use into
+`ComfyUI/models/dblm_se/DBLM-SE/` (or `git clone https://github.com/Yorch233/DBLM-SE`
+there yourself). Install its extra modules once. Do **not** use DBLM-SE's own
+`requirements.txt`: it pins an old PyTorch that would break ComfyUI.
 
 ```bash
-git clone https://github.com/Yorch233/DBLM-SE ComfyUI/models/dblm_se/DBLM-SE
-python -m pip install einops tabulate accelerate vector-quantize-pytorch torchtune torchao transformers pyyaml huggingface_hub
+python -m pip install einops tabulate accelerate vector-quantize-pytorch transformers pyyaml
 ```
+
+`torchtune` is optional: when it is missing, ReaComfy uses an identical built-in
+rotary-embedding module instead.
 
 `DBLM_SE_REPO` can point to another checkout. The weights (~11 GB: model,
 WavLM-Large, w2v-BERT and XCodec2) download on first use into
