@@ -2,6 +2,12 @@
 
 All notable changes to ReaComfy are documented here.
 
+## [0.5.2] - 2026-11-26
+
+### Changed
+
+- Added the REAPER forum thread (https://forum.cockos.com/showthread.php?t=311369) to the README and package links.
+
 ## [0.5.1] - 2026-11-26
 
 ### Changed

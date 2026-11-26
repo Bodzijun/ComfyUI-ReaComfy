@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-reacomfy"
 description = "REAPER <-> ComfyUI bridge nodes: send audio, MIDI, text and video from REAPER, process it in ComfyUI (voice isolation, enhancement, EQ/room match, YuE2 helpers) and import results back to the timeline."
-version = "0.5.1"
+version = "0.5.2"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
@@ -20,6 +20,8 @@ dev = ["pytest"]
 [project.urls]
 Repository = "https://github.com/Bodzijun/ComfyUI-ReaComfy"
 "Bug Tracker" = "https://github.com/Bodzijun/ComfyUI-ReaComfy/issues"
+Documentation = "https://github.com/Bodzijun/ComfyUI-ReaComfy#readme"
+Forum = "https://forum.cockos.com/showthread.php?t=311369"
 
 [tool.comfy]
 PublisherId = "bogdan-sbp"

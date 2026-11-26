@@ -1,9 +1,11 @@
-# ComfyUI-ReaComfy — REAPER Bridge nodes (ReaComfy 0.5.1)
+# ComfyUI-ReaComfy — REAPER Bridge nodes (ReaComfy 0.5.2)
 
 ComfyUI custom nodes that exchange audio, MIDI, text and video with the active
 REAPER project. They are the ComfyUI half of
 [ReaComfy](#reaper-side): the REAPER scripts send material to ComfyUI and import
 the results back to the timeline. Works on Windows, macOS and Linux.
+
+Discussion, updates and support: [ReaComfy thread on the Cockos REAPER forum](https://forum.cockos.com/showthread.php?t=311369).
 
 ## Installation
 
@@ -173,6 +175,7 @@ addition to the audio `path`. The REAPER-side sender must create these fields.
 The REAPER scripts (launcher, send/import actions, Python bridge) are
 distributed separately as the ReaComfy script package. Load `ReaComfy.lua` in
 REAPER's action list; see that package's README.
+Downloads and discussion: [REAPER forum thread](https://forum.cockos.com/showthread.php?t=311369).
 
 ## License
 
