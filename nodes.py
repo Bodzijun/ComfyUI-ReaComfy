@@ -2976,9 +2976,16 @@ def run_edit(engine, state, job):
     from zonos3.tts.edit_runtime import EditRuntime
 
     if "aligner" not in state:
-        state["aligner"] = (
-            edit_align.FuseAlignWorker() if edit_align.fusealign_installed() else None
-        )
+        aligner = None
+        if edit_align.fusealign_installed():
+            # ZONOS3 starts its helper workers with HF_HUB_OFFLINE=1, so fetch the
+            # FuseAlign checkpoint here (once, ~1.3 GB) and hand over the local file.
+            from fusealign_hub.aligner import CHECKPOINT_FILE, HF_REPO
+            from huggingface_hub import hf_hub_download
+
+            checkpoint = hf_hub_download(repo_id=HF_REPO, filename=CHECKPOINT_FILE)
+            aligner = edit_align.FuseAlignWorker(checkpoint=checkpoint)
+        state["aligner"] = aligner
     request = dict(job["edit"])
     if state["aligner"] is None:
         if request.get("spans") is None:
