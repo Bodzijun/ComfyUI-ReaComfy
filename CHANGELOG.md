@@ -6,6 +6,7 @@ All notable changes to ReaComfy are documented here.
 
 ### Fixed
 
+- ZONOS3 on Windows: voice cloning failed with "No module named 'fcntl'". The worker now provides harmless stand-ins for ZONOS3's Unix-only imports, and an updated worker replaces the copy from an earlier install automatically.
 - ZONOS3 workflows saved with backend "server" (or "reference" without paths) failed with "Cannot reach the ZONOS3 server". The node now falls back to the automatic install when that backend is not set up.
 - DBLM-SE: an outdated vector-quantize-pytorch without ResidualFSQ is upgraded automatically.
 - DBLM-SE stopped with "needs an extra module (vector_quantize_pytorch)" when the module was present but broken. Missing or broken modules are now reinstalled automatically (with an upgrade on the second try) and checked before the node continues.

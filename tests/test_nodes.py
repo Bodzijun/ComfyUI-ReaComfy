@@ -508,9 +508,11 @@ for line in sys.stdin:
 def test_zonos3_managed_worker_protocol(nodes, monkeypatch, tmp_path):
     base = tmp_path / "zonos3"
     base.mkdir()
+    # A stale script on disk must be replaced by the current worker.
     (base / "reacomfy_zonos3_worker.py").write_text(
-        FAKE_ZONOS3_WORKER, encoding="utf-8"
+        "raise SystemExit(3)", encoding="utf-8"
     )
+    monkeypatch.setattr(nodes, "ZONOS3_WORKER", FAKE_ZONOS3_WORKER)
     runtime = nodes._Zonos3Runtime
     monkeypatch.setattr(runtime, "base", staticmethod(lambda: base))
     monkeypatch.setattr(
@@ -529,3 +531,24 @@ def test_zonos3_managed_worker_protocol(nodes, monkeypatch, tmp_path):
     assert audio["sample_rate"] == 44100
     assert audio["waveform"].shape == (1, 1, len("Раз") + len("Два три"))
     assert json.loads(info)["seeds"] == ["99", "99"]
+
+
+def test_zonos3_worker_windows_shims(nodes, monkeypatch):
+    namespace = {"__name__": "reacomfy_worker_test"}
+    exec(compile(nodes.ZONOS3_WORKER, "worker", "exec"), namespace)
+    monkeypatch.delitem(sys.modules, "fcntl", raising=False)
+    monkeypatch.delenv("ZONOS3_AUDIO_CODEC_DEVICE", raising=False)
+    real_import = __import__
+
+    def no_fcntl(name, *args, **kwargs):
+        if name == "fcntl":
+            raise ImportError("No module named 'fcntl'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", no_fcntl)
+    namespace["windows_shims"]("cpu")
+    monkeypatch.setattr("builtins.__import__", real_import)
+    import os
+
+    assert sys.modules["fcntl"].flock(None, sys.modules["fcntl"].LOCK_EX) is None
+    assert os.environ["ZONOS3_AUDIO_CODEC_DEVICE"] == "cpu"

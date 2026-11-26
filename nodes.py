@@ -2782,8 +2782,30 @@ def say(payload):
     sys.stdout.flush()
 
 
+def windows_shims(device):
+    """ZONOS3 imports a few Unix-only modules; make them harmless on Windows."""
+    import os
+    import types
+
+    try:
+        import fcntl  # noqa: F401
+    except ImportError:
+        fcntl = types.ModuleType("fcntl")
+        fcntl.LOCK_SH, fcntl.LOCK_EX, fcntl.LOCK_NB, fcntl.LOCK_UN = 1, 2, 4, 8
+        fcntl.flock = lambda *args, **kwargs: None
+        fcntl.lockf = lambda *args, **kwargs: None
+        sys.modules["fcntl"] = fcntl
+    if not hasattr(os, "getuid"):
+        os.getuid = lambda: 0
+    # The reference codec defaults to cuda:0; follow the device ReaComfy chose.
+    os.environ.setdefault(
+        "ZONOS3_AUDIO_CODEC_DEVICE", "cuda:0" if device == "cuda" else device
+    )
+
+
 def main():
     device, dtype_name, bundle = sys.argv[1], sys.argv[2], sys.argv[3]
+    windows_shims(device)
     import io
     import wave
 
@@ -2925,7 +2947,8 @@ class _Zonos3Runtime:
 
         home = cls.ensure_installed()
         script = cls.base() / "reacomfy_zonos3_worker.py"
-        if not script.is_file():
+        # Rewrite on every start so fixes in a new ReaComfy reach old installs.
+        if not script.is_file() or script.read_text(encoding="utf-8") != ZONOS3_WORKER:
             script.write_text(ZONOS3_WORKER, encoding="utf-8")
         device = _resolve_device(device)
         dtype = "bf16" if device == "cuda" else "f32"
