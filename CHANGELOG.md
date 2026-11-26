@@ -2,6 +2,12 @@
 
 All notable changes to ReaComfy are documented here.
 
+## [0.5.1] - 2026-11-26
+
+### Changed
+
+- Reformatted `nodes.py` (one statement per line) to pass the Comfy Registry code checks. No behaviour changes.
+
 ## [0.5.0] - 2026-11-26
 
 ### Added

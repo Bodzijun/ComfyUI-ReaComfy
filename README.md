@@ -1,4 +1,4 @@
-# ComfyUI-ReaComfy — REAPER Bridge nodes (ReaComfy 0.5.0)
+# ComfyUI-ReaComfy — REAPER Bridge nodes (ReaComfy 0.5.1)
 
 ComfyUI custom nodes that exchange audio, MIDI, text and video with the active
 REAPER project. They are the ComfyUI half of
