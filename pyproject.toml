@@ -22,7 +22,7 @@ Repository = "https://github.com/Bodzijun/ComfyUI-ReaComfy"
 "Bug Tracker" = "https://github.com/Bodzijun/ComfyUI-ReaComfy/issues"
 
 [tool.comfy]
-PublisherId = ""
+PublisherId = "bogdan-sbp"
 DisplayName = "ReaComfy (REAPER Bridge)"
 Icon = ""
 includes = []
