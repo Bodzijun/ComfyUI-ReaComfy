@@ -35,16 +35,13 @@ The nodes read and write a small file protocol in an exchange folder:
 
 ## Optional modules and model installation
 
-All Python packages must be installed into the same Python environment that
-runs ComfyUI:
-
-```bash
-python -m pip install <package>
-```
-
-Restart ComfyUI after installing a module. Do not use a global Python
-environment and do not force a full PyTorch reinstall unless the module's own
-documentation explicitly requires it.
+Nothing has to be installed by hand. Nodes that need extra Python modules
+(ClearVoice, LavaSR, RE-USE) install them into ComfyUI's own Python the first
+time you run them, in any ComfyUI install (portable, desktop or venv); ZONOS3
+builds its own private environment. Model weights download on first use. The
+first run of such a node therefore takes a few minutes; watch the ComfyUI
+console for `[ReaComfy] Installing ...` lines. Your ComfyUI's torch and numpy
+are never upgraded or downgraded.
 
 ### Inworld Voice Isolator
 
@@ -215,11 +212,11 @@ Additional YuE2 helpers are available when YuE2-ComfyUI is installed:
 - `REAPER Score Output` saves ABC and optional lyrics into the project cache and exports the same score to MIDI by default. The MIDI can be imported back into REAPER with `ReaComfy - Import Score Output.lua`.
 - `REAPER Chords → ABC (Chord-only)` builds a valid two-voice YuE2 score from sectioned chord text without requiring MIDI. Set BPM and key, then connect its `score_abc` output to `YuE2 Generate Song` or `REAPER Score Output`.
 - `REAPER Video Input` exposes `video_path`, native `video`, `woosh_video`, `images`, and `fps`. `limit_duration` is disabled by default for compatibility; enable it when a downstream frame-based pipeline should use only `max_duration_s` seconds.
-- `REAPER Audio Inpaint / De-Click Repair` is a lightweight CPU restoration node for short clicks, crackles and small dropouts. It uses conservative median-residual detection and interpolation from neighboring samples; adjust `sensitivity`, `max_repair_ms` and `strength`. It uses SciPy (installed with the pack) and needs no additional model.
+- `REAPER Audio Inpaint / De-Click Repair` removes clicks, mouth/saliva noise and short digital dropouts on the CPU, with no model to download. It whitens the audio with a short-term AR and a pitch predictor, so speech, sibilants, drums and synth waveforms are left alone while clicks stand out, and rebuilds each damaged region with high-order least-squares AR interpolation (LSAR) that keeps the pitch and texture around it. Mouth noise is replaced only above 2 kHz, so the voice underneath stays original; dropouts up to 50 ms are rebuilt full-band. `sensitivity` / `mouth_sensitivity`: lower finds more. `speech_protect`: higher keeps more natural transients. `strength`: 1.0 removes a found defect completely, 0.5 halves it. Set `output` to `removed` to hear only what was taken out. SciPy installs itself if missing.
 - `REAPER EQ Match` uses deterministic STFT/iSTFT DSP to match a target recording to a reference spectrum. It includes strength, maximum correction, smoothing, and low/high frequency limits; it does not use an AI model or change timing.
 - `REAPER Dynamic Voice Match` is the dialogue-oriented variant. It follows the target spectrum frame by frame with voice gating and slow temporal smoothing, helping stabilize interview and lavalier recordings whose tone changes with distance or mic angle. Use a clean speech excerpt as `reference_audio`; start with match strength 0.35–0.50 and maximum correction 2–3 dB.
 - `REAPER Dynamic Voice Leveler` is an offline speech-dynamics processor. It smooths short-term voice level, leaves gated pauses mostly unchanged, limits the correction range, and applies a final peak safety stage. A practical dialogue starting point is target `-20 dB`, gate `-45 dB`, max gain/cut `6 dB`, attack `120 ms`, release `650 ms`, ceiling `-1 dB`.
-- `REAPER ClearVoice Enhance` is an optional full-band neural speech enhancer based on ClearVoice's `MossFormer2_SE_48K` model. It is intended for modern 48 kHz dialogue cleanup and can be blended with the dry signal using `strength`. Install the optional dependency in the active ComfyUI environment with `pip install clearvoice`; the model checkpoint is downloaded on first use.
+- `REAPER ClearVoice Enhance` is a full-band neural speech enhancer based on ClearVoice's `MossFormer2_SE_48K` model. It is intended for modern 48 kHz dialogue cleanup and can be blended with the dry signal using `strength`. ClearVoice and the model checkpoint install themselves on first use.
 - `REAPER ClearVoice Super Resolution` uses `MossFormer2_SR_48K` to restore speech bandwidth after low-rate cloning or processing. It accepts any input sample rate, internally works at 48 kHz, and outputs 48 kHz audio. ClearVoice recommends enhancement before super-resolution when the source is noisy.
 - `REAPER Room Match Hybrid` estimates a usable room profile from a lavalier plus a distant/ambient microphone. It aligns the recordings, estimates a regularized transfer response over speech frames, smooths the transfer magnitude, applies a gentle high-frequency roll-off (`ir_high_cut_hz`, not a brick-wall cut), extracts early reflections, fits the late-tail shape from the measured decay/RT60, and allows tuning it with `tail_rt60_scale`. Use `early_gain_db` and `late_gain_db` to balance early reflections against the late tail independently. A soft RMS gate (`tail_floor_db`) prevents crunchy noise, while `early_reflections_ms` controls the measured early-field window. `max_alignment_ms` limits how far the node searches for the relative recording delay; it is not the IR length. The node estimates RT60/DRR/pre-delay and returns both a convolution-ready `room_ir` AUDIO output and a JSON profile. It is a hybrid acoustic approximation, not a measured swept-sine impulse response; the two recordings should be simultaneous and share the same clock as closely as possible.
 

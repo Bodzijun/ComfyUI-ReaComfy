@@ -641,3 +641,57 @@ def test_speech_edit_keeps_original_outside_the_fix(nodes):
     # The fill is level-matched back to the original's loudness.
     inside = out[:, s0 + 100 : s0 + fill_len - 100]
     assert np.allclose(inside, fill[100 : fill_len - 100], atol=0.02)
+
+
+def _inpaint_test_signal(sample_rate=48000, seconds=1.0):
+    import numpy as np
+
+    rng = np.random.default_rng(7)
+    t = np.arange(int(sample_rate * seconds)) / sample_rate
+    voiced = sum(np.sin(2 * np.pi * 140 * h * t + h) / h for h in range(1, 12)) * 0.2
+    decay = 0.9 ** np.arange(64)
+    breath = np.convolve(rng.standard_normal(len(t)), decay)[: len(t)] * 0.002
+    clean = voiced + breath
+    dirty = clean.copy()
+    for pos in (6000, 15000, 27000, 39000):
+        dirty[pos] += 0.5
+        dirty[pos + 1] -= 0.3
+    dirty[20000:20240] = 0.0  # 5 ms digital dropout
+    return clean, dirty
+
+
+def _inpaint(nodes, data, sample_rate=48000, **kwargs):
+    audio = {
+        "waveform": torch.from_numpy(data.astype("float32")).view(1, 1, -1),
+        "sample_rate": sample_rate,
+    }
+    out, info = nodes.ReaperAudioInpaint().repair(audio, **kwargs)
+    return out["waveform"][0, 0].numpy().astype("float64"), json.loads(info)
+
+
+def test_audio_inpaint_removes_clicks_and_dropouts(nodes):
+    import numpy as np
+
+    clean, dirty = _inpaint_test_signal()
+    repaired, info = _inpaint(nodes, dirty)
+    before = np.sum((dirty - clean) ** 2)
+    after = np.sum((repaired - clean) ** 2)
+    assert info["repaired_clicks"] >= 4
+    assert info["repaired_dropouts"] == 1
+    assert after < before * 0.03  # at least ~15 dB less damage
+
+
+def test_audio_inpaint_leaves_clean_audio_and_scales_with_strength(nodes):
+    import numpy as np
+
+    clean, dirty = _inpaint_test_signal()
+    untouched, info = _inpaint(nodes, clean)
+    assert info["repaired_regions"] == 0
+    assert np.max(np.abs(untouched - clean)) < 1e-6
+    full, _ = _inpaint(nodes, dirty, strength=1.0)
+    half, _ = _inpaint(nodes, dirty, strength=0.5)
+    off, _ = _inpaint(nodes, dirty, strength=0.0)
+    assert np.max(np.abs(off - dirty)) < 1e-6
+    assert np.allclose(half - dirty, (full - dirty) * 0.5, atol=1e-5)
+    removed, _ = _inpaint(nodes, dirty, output="removed")
+    assert np.allclose(removed, dirty - full, atol=1e-5)

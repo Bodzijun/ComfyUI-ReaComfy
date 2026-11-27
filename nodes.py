@@ -677,7 +677,7 @@ class ReaperDynamicVoiceLeveler:
 
 
 class ReaperClearVoiceEnhance:
-    DESCRIPTION = "Full-band speech enhancement using ClearVoice MossFormer2_SE_48K. Requires the optional clearvoice package; models are downloaded on first use."
+    DESCRIPTION = "Full-band speech enhancement using ClearVoice MossFormer2_SE_48K. ClearVoice and the model install themselves on first use (no terminal needed)."
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -915,8 +915,210 @@ class ReaperClearVoiceSuperResolution:
         return ({"waveform": enhanced, "sample_rate": 48000},)
 
 
+def _inpaint_ar(segment, order, sample_rate, solve_toeplitz):
+    """Autocorrelation AR estimate with lag window and white-noise floor."""
+    import numpy as np
+
+    windowed = segment * np.hanning(len(segment))
+    corr = np.correlate(windowed, windowed, "full")[
+        len(windowed) - 1 : len(windowed) + order
+    ].copy()
+    if corr[0] <= 1e-14:
+        return np.zeros(order)
+    corr[0] *= 1.0001
+    lags = np.arange(1, order + 1)
+    corr[1:] *= np.exp(-0.5 * (2.0 * np.pi * 40.0 / sample_rate * lags) ** 2)
+    return solve_toeplitz(corr[:order], corr[1 : order + 1])
+
+
+def _inpaint_pitch_lag(excitation, sample_rate, low_ms=2.5, high_ms=16.0):
+    """Pitch period (samples) and normalized strength from an AR residual."""
+    import numpy as np
+
+    low = int(sample_rate * low_ms / 1000.0)
+    high = min(int(sample_rate * high_ms / 1000.0), len(excitation) // 2)
+    if high <= low + 2:
+        return 0, 0.0
+    spectrum = np.fft.rfft(excitation, 2 * len(excitation))
+    corr = np.fft.irfft(np.abs(spectrum) ** 2)[: high + 2]
+    if corr[0] <= 0:
+        return 0, 0.0
+    lag = low + int(np.argmax(corr[low:high]))
+    return lag, float(corr[lag] / corr[0])
+
+
+def _inpaint_runs(mask):
+    import numpy as np
+
+    edges = np.flatnonzero(np.diff(np.r_[0, mask.astype(np.int8), 0]))
+    return list(zip(edges[::2].tolist(), edges[1::2].tolist()))
+
+
+def _inpaint_residual(signal, order, block, hop, sample_rate, lfilter, solve_toeplitz):
+    """Whitened excitation: short-term AR plus a 3-tap pitch predictor.
+
+    Speech, music and noise become close to white noise here, while clicks and
+    mouth noise stay as outliers.  Glottal pulses repeat every pitch period, so
+    the long-term predictor removes most of them before detection.
+    """
+    import numpy as np
+
+    length = len(signal)
+    excitation = np.zeros(length)
+    centers, scales = [], []
+    starts = list(range(0, max(1, length - block) + 1, hop))
+    if starts[-1] + block < length:
+        starts.append(length - block)
+    lead = order + int(sample_rate * 0.017)
+    for start in starts:
+        coeffs = _inpaint_ar(
+            signal[start : start + block], order, sample_rate, solve_toeplitz
+        )
+        lo = max(0, start - lead)
+        res = lfilter(np.r_[1.0, -coeffs], [1.0], signal[lo : start + block])
+        lag, rho = _inpaint_pitch_lag(res[start - lo :], sample_rate)
+        if lag and rho > 0.25 and len(res) > lag + 2:
+            rows = np.arange(max(lag + 1, start - lo), len(res))
+            past = np.stack([res[rows - lag + k] for k in (-1, 0, 1)], 1)
+            gains = np.linalg.lstsq(past, res[rows], rcond=None)[0]
+            res = res.copy()
+            res[rows] -= past @ np.clip(gains, -1.2, 1.2)
+        res = res[start - lo :]
+        keep_from = (block - hop) // 2 if start > 0 else 0
+        keep_to = keep_from + hop if start + block < length else len(res)
+        excitation[start + keep_from : start + keep_to] = res[keep_from:keep_to]
+        centers.append(start + block / 2.0)
+        scales.append(1.4826 * float(np.median(np.abs(res))))
+    return excitation, np.interp(np.arange(length), centers, scales)
+
+
+def _inpaint_fill(
+    signal, begin, end, order, sample_rate, noise, rng, lfilter, solve_toeplitz
+):
+    """Least-squares AR interpolation (Janssen/Godsill LSAR) of signal[begin:end].
+
+    The predictor has `order` short-term taps plus three taps around the pitch
+    period when the context is periodic, so voiced speech keeps its harmonics
+    across the gap.  With noise > 0 the result is drawn from the posterior
+    instead of its mean, so filled gaps keep the texture of breath/room noise.
+    """
+    import numpy as np
+    from scipy.linalg import cho_factor, cho_solve
+
+    gap = end - begin
+    context = max(4 * order, int(sample_rate * 0.025), 3 * gap)
+    lo = max(0, begin - context)
+    hi = min(len(signal), end + context)
+    seg = signal[lo:hi]
+    g0, g1 = begin - lo, end - lo
+    known = np.ones(len(seg), dtype=bool)
+    known[g0:g1] = False
+    taps = list(range(1, order + 1))
+    side = seg[:g0] if g0 >= len(seg) - g1 else seg[g1:]
+    if len(side) > 4 * order:
+        coeffs = _inpaint_ar(side, order, sample_rate, solve_toeplitz)
+        res = lfilter(np.r_[1.0, -coeffs], [1.0], side)[order:]
+        high_ms = min(16.0, 1000.0 * len(res) / (2.0 * sample_rate))
+        # Pitch from the whitened residual (speech) or, for strongly
+        # harmonic material whose residual is mostly noise, the waveform.
+        lag, rho = _inpaint_pitch_lag(res, sample_rate, 2.5, high_ms)
+        if rho <= 0.3:
+            lag, rho = _inpaint_pitch_lag(side - side.mean(), sample_rate, 2.5, high_ms)
+            rho -= 0.3
+        if lag > order + 1 and rho > 0.3:
+            taps += [lag - 1, lag, lag + 1]
+    taps = np.asarray(taps)
+    max_tap = int(taps.max())
+    unknown = np.flatnonzero(~known)
+    touched = np.zeros(len(seg), dtype=bool)
+    for tap in np.r_[0, taps]:
+        idx = unknown + tap
+        touched[idx[idx < len(seg)]] = True
+    touched[:max_tap] = True
+    rows = np.flatnonzero(~touched)
+    if len(rows) < 2 * len(taps):
+        return None
+    design = seg[rows[:, None] - taps[None, :]]
+    target = seg[rows]
+    gram = design.T @ design
+    ridge = 1e-4 * np.trace(gram) / len(taps) + 1e-14
+    coeffs = np.linalg.solve(gram + ridge * np.eye(len(taps)), design.T @ target)
+    sigma2 = float(np.mean((target - design @ coeffs) ** 2))
+    first = max(max_tap, g0)
+    last = min(len(seg), g1 + max_tap)
+    out_rows = np.arange(first, last)
+    matrix = np.zeros((last - first, len(seg)))
+    matrix[out_rows - first, out_rows] = 1.0
+    for tap, coeff in zip(taps, coeffs):
+        matrix[out_rows - first, out_rows - tap] -= coeff
+    a_unknown = matrix[:, g0:g1]
+    a_known = matrix[:, known]
+    normal = a_unknown.T @ a_unknown + 1e-8 * np.eye(gap)
+    factor = cho_factor(normal)
+    fill = -cho_solve(factor, a_unknown.T @ (a_known @ seg[known]))
+    if noise > 0.0 and sigma2 > 0.0:
+        chol = np.linalg.cholesky(normal)
+        draw = np.linalg.solve(chol.T, rng.standard_normal(gap))
+        # Never louder than the local prediction error (periodic material can
+        # make the posterior spread large).
+        draw /= max(1.0, float(np.sqrt(np.mean(draw**2))))
+        fill = fill + noise * np.sqrt(sigma2) * draw
+    return fill
+
+
+def _inpaint_fix_low_band(
+    signal, begin, end, sample_rate, rng, lfilter, solve_toeplitz
+):
+    """Rebuild the low band (< 150 Hz) of a filled dropout at a 1 kHz rate.
+
+    At 48 kHz a short-term predictor spans well under a millisecond, far too
+    little to continue hum, rumble or a DC offset across a gap, so the fill
+    sags and the edges thump. At 1 kHz the same interpolation sees 200 ms of
+    the low band and continues it smoothly; only that band is replaced.
+    """
+    import numpy as np
+    from scipy.signal import butter, sosfiltfilt
+
+    factor = int(sample_rate // 1000)
+    if factor < 8:
+        return signal
+    low_rate = sample_rate / factor
+    gap = end - begin
+    context = max(int(sample_rate * 0.2), 8 * gap)
+    lo = max(0, begin - context)
+    hi = min(len(signal), end + context)
+    lowpass = butter(4, 150.0 / (sample_rate / 2.0), "low", output="sos")
+    band = sosfiltfilt(lowpass, signal[lo:hi])
+    low = band[::factor]
+    margin = int(np.ceil(0.006 * low_rate))  # reach of the 150 Hz filter
+    g0 = max(0, (begin - lo) // factor - margin)
+    g1 = min(len(low), -(-(end - lo) // factor) + margin)
+    if g0 < 24 or g1 > len(low) - 24:
+        return signal
+    order = int(min(max(24, 2 * (g1 - g0)), 64))
+    fill = _inpaint_fill(
+        low, g0, g1, order, low_rate, 0.0, rng, lfilter, solve_toeplitz
+    )
+    if fill is None:
+        return signal
+    diff = np.zeros(len(low))
+    diff[g0:g1] = fill - low[g0:g1]
+    positions = np.arange(hi - lo) / factor
+    correction = np.interp(positions, np.arange(len(low)), diff)
+    out = signal.copy()
+    out[lo:hi] += sosfiltfilt(lowpass, correction)
+    return out
+
+
 class ReaperAudioInpaint:
-    DESCRIPTION = "CPU audio repair for hard clicks and short mouth/saliva noises. Uses separate impulse and short spectral-burst detectors, protects sustained speech fricatives, and reconstructs only isolated damaged regions from neighboring samples."
+    DESCRIPTION = (
+        "CPU repair of clicks, mouth/saliva noise and short dropouts. Detects defects "
+        "as outliers of a whitened (AR + pitch-predicted) signal, so speech, sibilants "
+        "and music are left alone, and rebuilds each damaged region with high-order "
+        "least-squares AR interpolation that keeps the pitch and texture of the "
+        "surrounding audio. Mouth noise is replaced only above 2 kHz, so the voice "
+        "underneath stays original. Set output to 'removed' to hear what is taken out."
+    )
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -926,31 +1128,182 @@ class ReaperAudioInpaint:
                 "mode": (["auto", "de_click", "inpaint"], {"default": "auto"}),
                 "sensitivity": (
                     "FLOAT",
-                    {"default": 8.0, "min": 2.0, "max": 20.0, "step": 0.5},
+                    {
+                        "default": 8.0,
+                        "min": 2.0,
+                        "max": 20.0,
+                        "step": 0.5,
+                        "tooltip": "Click threshold. Lower finds more (and quieter) clicks.",
+                    },
                 ),
                 "mouth_sensitivity": (
                     "FLOAT",
-                    {"default": 8.0, "min": 2.0, "max": 20.0, "step": 0.5},
+                    {
+                        "default": 8.0,
+                        "min": 2.0,
+                        "max": 20.0,
+                        "step": 0.5,
+                        "tooltip": "Threshold for 1-15 ms mouth/saliva bursts. Lower finds more.",
+                    },
                 ),
                 "speech_protect": (
                     "FLOAT",
-                    {"default": 0.80, "min": 0.0, "max": 1.0, "step": 0.05},
+                    {
+                        "default": 0.80,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.05,
+                        "tooltip": "Higher keeps more sharp but natural sounds (plosives, "
+                        "consonant onsets, transients). Lower for non-speech material.",
+                    },
                 ),
                 "max_repair_ms": (
                     "FLOAT",
-                    {"default": 8.0, "min": 0.5, "max": 15.0, "step": 0.5},
+                    {
+                        "default": 8.0,
+                        "min": 0.5,
+                        "max": 15.0,
+                        "step": 0.5,
+                        "tooltip": "Longest click/mouth region that is rebuilt. Digital "
+                        "dropouts (silent gaps) are rebuilt up to 50 ms in auto/inpaint.",
+                    },
                 ),
                 "strength": (
                     "FLOAT",
-                    {"default": 0.75, "min": 0.0, "max": 1.0, "step": 0.05},
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.05,
+                        "tooltip": "How much of each found defect is removed. 1.0 replaces "
+                        "it completely; lower values leave part of it.",
+                    },
                 ),
-            }
+            },
+            "optional": {
+                "output": (
+                    ["repaired", "removed"],
+                    {
+                        "default": "repaired",
+                        "tooltip": "'removed' returns only what the repair took out, to check "
+                        "that nothing useful is lost.",
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("AUDIO", "STRING")
     RETURN_NAMES = ("audio", "repair_info")
     FUNCTION = "repair"
     CATEGORY = "REAPER AI/Restoration"
+
+    def _detect(self, signal, sample_rate, mode, click_k, burst_k, ratio, tools):
+        import numpy as np
+
+        (
+            lfilter,
+            solve_toeplitz,
+            binary_dilation,
+            label,
+            rank_filter,
+            uniform_filter1d,
+        ) = tools
+        order = int(np.clip(round(sample_rate * 0.0008), 16, 48))
+        block = int(2 ** np.ceil(np.log2(sample_rate * 0.03)))
+        hop = block // 2
+        peak = max(float(np.max(np.abs(signal))), 1e-9)
+        clicks = np.zeros(len(signal), dtype=bool)
+        mouth = np.zeros(len(signal), dtype=bool)
+        if len(signal) > 2 * block:
+            fwd, fwd_scale = _inpaint_residual(
+                signal, order, block, hop, sample_rate, lfilter, solve_toeplitz
+            )
+            bwd, bwd_scale = _inpaint_residual(
+                signal[::-1].copy(),
+                order,
+                block,
+                hop,
+                sample_rate,
+                lfilter,
+                solve_toeplitz,
+            )
+            bwd, bwd_scale = bwd[::-1], bwd_scale[::-1]
+            floor = max(float(np.median(fwd_scale)) * 0.05, peak * 1e-4, 1e-9)
+            z_fwd = np.abs(fwd) / np.maximum(fwd_scale, floor)
+            z_bwd = np.abs(bwd) / np.maximum(bwd_scale, floor)
+            # Forward and backward residuals smear in opposite directions; their
+            # geometric mean pins the click to its true samples.
+            impulse = np.sqrt(z_fwd * z_bwd)
+            short = max(3, int(sample_rate * 0.001))
+            burst = np.sqrt(
+                np.maximum(uniform_filter1d(np.minimum(z_fwd, z_bwd) ** 2, short), 0.0)
+            )
+            # A defect must also stand out from the strongest events of the
+            # surrounding +-20 ms. Pitch pulses, drum hits and the edges of
+            # synth waveforms repeat there; a click or mouth noise does not.
+            chunks = int(np.ceil(len(signal) / short))
+            pad = chunks * short - len(signal)
+            footprint = np.ones(41, dtype=bool)
+            footprint[19:22] = False
+
+            def neighbourhood(score):
+                peaks = np.r_[score, np.zeros(pad)].reshape(chunks, short).max(1)
+                # third-strongest other event nearby (two more may be clicks too)
+                typical = rank_filter(peaks, -3, footprint=footprint, mode="nearest")
+                typical = np.maximum(typical, 1.0)
+                return np.repeat(peaks / typical, short)[: len(signal)]
+
+            def grown(seed, grow):
+                labels, _ = label(grow | seed)
+                keep = np.unique(labels[seed])
+                return np.isin(labels, keep[keep > 0])
+
+            # Impulsive clicks stay tight (a few samples); bursts grow over
+            # their decaying tail.
+            seed = (impulse > click_k) & (neighbourhood(impulse) > ratio)
+            clicks = np.zeros(len(signal), dtype=bool)
+            # Grow each click over its neighbours, but not over the faint
+            # smear the prediction filters leave around a very loud click.
+            for begin, end in _inpaint_runs(grown(seed, impulse > click_k * 0.5)):
+                part = impulse[begin:end]
+                strong = np.flatnonzero(part > max(click_k * 0.5, 0.03 * part.max()))
+                clicks[begin + strong[0] : begin + strong[-1] + 1] = True
+            if mode != "inpaint":
+                seed = (burst > burst_k) & (neighbourhood(burst) > ratio)
+                bursts = grown(seed, burst > burst_k * 0.35)
+                # The 1 ms burst score also lights up around a lone strong
+                # click. A region is mouth noise only when its excess is
+                # spread out, not packed into a few samples.
+                long_enough = int(sample_rate * 0.0012)
+                for begin, end in _inpaint_runs(bursts):
+                    if end - begin < long_enough:
+                        continue
+                    energy = impulse[begin:end] ** 2
+                    top = np.sort(energy)[-3:].sum()
+                    if top < 0.6 * energy.sum():
+                        mouth[begin:end] = True
+                clicks |= bursts
+            clicks = binary_dilation(
+                clicks, iterations=max(1, int(sample_rate * 0.0001))
+            )
+        dropouts = np.zeros(len(signal), dtype=bool)
+        if mode != "de_click":
+            flat = np.abs(np.diff(signal, prepend=signal[0])) < peak * 1e-5
+            envelope = np.sqrt(
+                np.maximum(
+                    uniform_filter1d(signal * signal, max(8, int(sample_rate * 0.02))),
+                    0.0,
+                )
+            )
+            reach = int(sample_rate * 0.012)
+            for begin, end in _inpaint_runs(flat):
+                if end - begin < int(sample_rate * 0.0005):
+                    continue
+                left = envelope[max(0, begin - reach)]
+                right = envelope[min(len(signal) - 1, end + reach)]
+                if min(left, right) > peak * 0.003:
+                    dropouts[max(0, begin - 2) : end + 2] = True
+        return clicks, mouth, dropouts, order
 
     def repair(
         self,
@@ -960,225 +1313,178 @@ class ReaperAudioInpaint:
         mouth_sensitivity=8.0,
         speech_protect=0.80,
         max_repair_ms=8.0,
-        strength=0.75,
+        strength=1.0,
+        output="repaired",
     ):
         if audio is None or "waveform" not in audio:
             raise ValueError("REAPER Audio Inpaint requires an AUDIO input")
+        _ensure_modules({"scipy.ndimage": "scipy"}, "REAPER Audio Inpaint")
         try:
+            from scipy.linalg import solve_toeplitz
             from scipy.ndimage import (
-                binary_closing,
-                gaussian_filter1d,
-                maximum_filter1d,
-                median_filter,
+                binary_dilation,
+                label,
+                rank_filter,
                 uniform_filter1d,
             )
+            from scipy.signal import butter, lfilter, sosfiltfilt
         except ImportError as error:
             raise RuntimeError(
-                "REAPER Audio Inpaint requires scipy. Install it with: pip install scipy"
+                "REAPER Audio Inpaint could not import scipy after installing it; "
+                "restart ComfyUI and run the node again"
             ) from error
         import numpy as np
 
+        tools = (
+            lfilter,
+            solve_toeplitz,
+            binary_dilation,
+            label,
+            rank_filter,
+            uniform_filter1d,
+        )
         waveform = audio["waveform"].detach().float().cpu()
         sample_rate = int(audio["sample_rate"])
         if waveform.ndim == 2:
             waveform = waveform.unsqueeze(0)
-        if waveform.ndim != 3 or waveform.shape[0] != 1:
+        if waveform.ndim != 3:
             raise ValueError(
-                "REAPER Audio Inpaint currently supports one audio batch at a time"
+                "REAPER Audio Inpaint expects audio shaped [batch, channels, samples]"
             )
-        data = waveform[0].numpy().copy()
-        channels, length = data.shape
-        if length < 16:
-            return (
-                {"waveform": waveform, "sample_rate": sample_rate},
-                json.dumps({"repaired_regions": 0, "mode": mode}),
-            )
-        mono = data.mean(axis=0)
-        # Detector 1: isolated, sub-3 ms waveform discontinuities.  The small
-        # median residual is deliberately kept independent of the mouth path.
-        med = median_filter(mono, size=9, mode="nearest")
-        residual = mono - med
-        robust = float(np.median(np.abs(residual - np.median(residual))) * 1.4826)
-        peak = max(float(np.max(np.abs(mono))), 1e-6)
-        mode_factor = (
-            1.50 if mode == "de_click" else (0.90 if mode == "inpaint" else 1.0)
-        )
-        threshold = max(
-            robust * float(sensitivity) * mode_factor, peak * 0.15 * mode_factor
-        )
-        local_rms = np.sqrt(
-            np.maximum(
-                gaussian_filter1d(mono * mono, max(1.0, 0.002 * sample_rate)), 1e-12
-            )
-        )
-        impulsive_ratio = np.abs(residual) / np.maximum(local_rms, peak * 0.002)
-        ratio_limit = 3.0 if mode == "de_click" else (1.6 if mode == "inpaint" else 2.5)
-        hard_candidate = (np.abs(residual) > threshold) & (
-            impulsive_ratio > ratio_limit
-        )
-
-        # Detector 2: mouth/saliva clicks are often 2-15 ms noisy bursts rather
-        # than single-sample spikes.  Compare short high-band energy and its
-        # flux with a 20 ms local baseline.  This is a light-weight spectral
-        # novelty proxy and avoids an STFT/ISTFT repair path.
-        hp_sigma = max(1.0, 0.00012 * sample_rate)
-        high_band = mono - gaussian_filter1d(mono, hp_sigma, mode="nearest")
-        short_window = max(3, int(0.0015 * sample_rate))
-        long_window = max(short_window + 2, int(0.020 * sample_rate))
-        short_hf = np.sqrt(
-            np.maximum(
-                uniform_filter1d(high_band * high_band, short_window, mode="nearest"),
-                1e-12,
-            )
-        )
-        long_hf = np.sqrt(
-            np.maximum(
-                uniform_filter1d(high_band * high_band, long_window, mode="nearest"),
-                1e-12,
-            )
-        )
-        hf_flux = np.abs(np.diff(high_band, prepend=high_band[0]))
-        short_flux = uniform_filter1d(hf_flux, short_window, mode="nearest")
-        long_flux = uniform_filter1d(hf_flux, long_window, mode="nearest")
-        energy_ratio = short_hf / np.maximum(long_hf, peak * 0.001)
-        flux_ratio = short_flux / np.maximum(long_flux, peak * 0.0002)
-        mouth_score = np.sqrt(
-            np.maximum(energy_ratio, 0.0) * np.maximum(flux_ratio, 0.0)
-        )
-        score_center = float(np.median(mouth_score))
-        score_mad = max(
-            float(np.median(np.abs(mouth_score - score_center)) * 1.4826), 0.03
-        )
-        mouth_limit = score_center + score_mad * (1.5 + 0.32 * float(mouth_sensitivity))
-        mouth_seed = (
-            (mouth_score > mouth_limit)
-            & (energy_ratio > 1.35)
-            & (flux_ratio > 1.20)
-            & (short_hf > peak * 0.0025)
-        )
-        mouth_expand = max(3, int(0.0015 * sample_rate))
-        mouth_candidate = (
-            maximum_filter1d(
-                mouth_seed.astype(np.uint8), size=mouth_expand, mode="nearest"
-            )
-            > 0
-        )
-        mouth_candidate = binary_closing(
-            mouth_candidate,
-            structure=np.ones(max(2, int(0.00075 * sample_rate)), dtype=bool),
-        )
-
-        candidate = hard_candidate | mouth_candidate
-        groups = []
-        start = None
-        for index, flag in enumerate(candidate):
-            if flag and start is None:
-                start = index
-            elif not flag and start is not None:
-                groups.append((start, index))
-                start = None
-        if start is not None:
-            groups.append((start, length))
+        amount = float(np.clip(strength, 0.0, 1.0))
+        click_k = float(sensitivity)
+        burst_k = 0.5 * float(mouth_sensitivity)
+        ratio = 1.0 + 2.5 * float(np.clip(speech_protect, 0.0, 1.0))
         max_samples = max(2, int(float(max_repair_ms) * sample_rate / 1000.0))
-        hard_max_samples = max(2, int(0.003 * sample_rate))
-        speech_context = max(4, int(0.020 * sample_rate))
-        # A fricative keeps high-band energy alive on both sides of a candidate;
-        # a mouth click is a local outlier with quiet/normal context.  Higher
-        # speech_protect lowers the tolerated sustained-HF occupancy.
-        hf_floor = max(float(np.median(short_hf)) * 1.8, peak * 0.0015)
-        hf_active = short_hf > np.maximum(long_hf * 0.72, hf_floor)
-        occupancy_limit = 0.72 - 0.34 * float(speech_protect)
-        repaired = 0
-        repaired_hard = 0
-        repaired_mouth = 0
-        protected_regions = 0
-        for begin, end in groups:
-            is_hard = bool(np.any(hard_candidate[begin:end]))
-            is_mouth = bool(np.any(mouth_candidate[begin:end]))
-            allowed_samples = (
-                max_samples if is_mouth else min(max_samples, hard_max_samples)
-            )
-            if end - begin > allowed_samples or begin < 2 or end >= length - 2:
+        dropout_max = max(max_samples, int(sample_rate * 0.05))
+        click_split = butter(
+            2,
+            min(120.0, 0.45 * sample_rate) / (sample_rate / 2.0),
+            "high",
+            output="sos",
+        )
+        hf_split = butter(
+            4,
+            min(2000.0, 0.45 * sample_rate) / (sample_rate / 2.0),
+            "high",
+            output="sos",
+        )
+        rng = np.random.default_rng(1234)
+        result = waveform.numpy().astype(np.float64).copy()
+        stats = {"clicks": 0, "mouth": 0, "dropouts": 0, "skipped_long": 0}
+        for item in range(result.shape[0]):
+            data = result[item]
+            channels, length = data.shape
+            if length < 64:
                 continue
-            context_start = max(0, begin - speech_context)
-            context_end = min(length, end + speech_context)
-            left_hf = (
-                float(np.mean(hf_active[context_start:begin]))
-                if begin > context_start
-                else 0.0
-            )
-            right_hf = (
-                float(np.mean(hf_active[end:context_end])) if context_end > end else 0.0
-            )
-            # At a consonant onset or release only one side may contain the
-            # sustained noise, so either side is sufficient for protection.
-            sustained_hf = max(left_hf, right_hf)
-            # Never punch holes in sustained s/z/sh/zh energy.  Even a tall
-            # sample inside a fricative is more safely left alone than treated
-            # as an isolated click; speech_protect can be lowered for a more
-            # aggressive pass when the source is known not to contain speech.
-            if float(speech_protect) > 0.0 and sustained_hf > occupancy_limit:
-                protected_regions += 1
-                continue
-            left = max(2, begin - max(2, int(0.001 * sample_rate)))
-            right = min(length - 3, end + max(2, int(0.001 * sample_rate)))
-            # Repair the short context around the impulse as well. Replacing
-            # only the flagged samples can leave a discontinuity at the edge.
-            span = np.arange(left, right)
-            if span.size == 0:
-                continue
+            clicks = np.zeros(length, dtype=bool)
+            dropouts = np.zeros(length, dtype=bool)
+            mouth = np.zeros(length, dtype=bool)
+            order = 16
             for channel in range(channels):
-                # Cubic Hermite bridge preserves the local slope at both
-                # edges; a plain linear bridge can create a low-frequency
-                # thump even when the click itself is removed.
-                y0, y1 = float(data[channel, left - 1]), float(data[channel, right])
-                m0 = float(data[channel, left] - data[channel, left - 2])
-                m1 = float(data[channel, right + 1] - data[channel, right - 1])
-                u = (span.astype(np.float64) - float(left - 1)) / float(
-                    right - left + 1
+                found, noisy, dropped, order = self._detect(
+                    data[channel], sample_rate, mode, click_k, burst_k, ratio, tools
                 )
-                h00 = 2.0 * u**3 - 3.0 * u**2 + 1.0
-                h10 = u**3 - 2.0 * u**2 + u
-                h01 = -2.0 * u**3 + 3.0 * u**2
-                h11 = u**3 - u**2
-                repaired_values = h00 * y0 + h10 * m0 + h01 * y1 + h11 * m1
-                # Fade the correction to zero at the boundaries so the
-                # repair cannot introduce a new discontinuity or LF thump.
-                taper = 0.5 - 0.5 * np.cos(2.0 * np.pi * u)
-                repaired_values = (
-                    data[channel, span]
-                    + (repaired_values - data[channel, span]) * taper
-                )
-                if float(strength) >= 1.0:
-                    data[channel, span] = repaired_values
-                elif float(strength) > 0.0:
-                    data[channel, span] += (
-                        repaired_values - data[channel, span]
-                    ) * float(strength)
-            repaired += 1
-            repaired_hard += int(is_hard)
-            repaired_mouth += int(is_mouth)
-        input_peak = max(float(np.max(np.abs(waveform[0].numpy()))), 1e-8)
-        output_peak = float(np.max(np.abs(data)))
-        if output_peak > input_peak:
-            data *= input_peak / output_peak
-        result = torch.from_numpy(data).unsqueeze(0)
+                clicks |= found
+                mouth |= noisy
+                dropouts |= dropped
+            regions = []
+            for begin, end in _inpaint_runs(clicks | dropouts):
+                if regions and begin - regions[-1][1] < order:
+                    regions[-1] = (regions[-1][0], end)
+                else:
+                    regions.append((begin, end))
+            for begin, end in regions:
+                span = end - begin
+                is_dropout = bool(dropouts[begin:end].any())
+                limit = dropout_max if is_dropout else max_samples
+                if span > limit or begin < order or end > length - order:
+                    stats["skipped_long"] += 1
+                    continue
+                fill_order = int(min(max(order, 2 * span), 400))
+                # Impulsive clicks and dropouts are replaced full-band. Longer
+                # bursts are mouth/saliva noise riding on the voice: only their
+                # high band is replaced, the voice below 2 kHz stays original.
+                band_split = not is_dropout and bool(mouth[begin:end].any())
+                for channel in range(channels):
+                    fill = _inpaint_fill(
+                        data[channel],
+                        begin,
+                        end,
+                        fill_order,
+                        sample_rate,
+                        0.5,
+                        rng,
+                        lfilter,
+                        solve_toeplitz,
+                    )
+                    if fill is None:
+                        continue
+                    if not is_dropout:
+                        # Only the band above the split is replaced, so the
+                        # repair can never change the low end (rumble, hum,
+                        # DC, the body of the voice) and cause a thump.
+                        split = hf_split if band_split else click_split
+                        pad = int(sample_rate * (0.004 if band_split else 0.02))
+                        lo, hi = max(0, begin - pad), min(length, end + pad)
+                        delta = np.zeros(hi - lo)
+                        delta[begin - lo : end - lo] = fill - data[channel, begin:end]
+                        delta = sosfiltfilt(split, delta)
+                        ramp = min(begin - lo, hi - end)
+                        if ramp > 8:
+                            fade = np.ones(hi - lo)
+                            edge = 0.5 - 0.5 * np.cos(np.linspace(0, np.pi, ramp))
+                            fade[:ramp] = edge
+                            fade[-ramp:] = edge[::-1]
+                            delta *= fade
+                        data[channel, lo:hi] += amount * delta
+                    else:
+                        repaired = data[channel].copy()
+                        repaired[begin:end] = fill
+                        repaired = _inpaint_fix_low_band(
+                            repaired,
+                            begin,
+                            end,
+                            sample_rate,
+                            rng,
+                            lfilter,
+                            solve_toeplitz,
+                        )
+                        lo = max(0, begin - int(sample_rate * 0.1))
+                        hi = min(length, end + int(sample_rate * 0.1))
+                        data[channel, lo:hi] += amount * (
+                            repaired[lo:hi] - data[channel, lo:hi]
+                        )
+                if is_dropout:
+                    stats["dropouts"] += 1
+                elif band_split:
+                    stats["mouth"] += 1
+                else:
+                    stats["clicks"] += 1
+            if output == "removed":
+                result[item] = waveform.numpy()[item].astype(np.float64) - data
+        out = torch.from_numpy(result.astype(np.float32))
         info = json.dumps(
             {
                 "mode": mode,
                 "sample_rate": sample_rate,
-                "repaired_regions": repaired,
-                "repaired_hard_clicks": repaired_hard,
-                "repaired_mouth_clicks": repaired_mouth,
-                "speech_protected_regions": protected_regions,
+                "repaired_regions": stats["clicks"]
+                + stats["mouth"]
+                + stats["dropouts"],
+                "repaired_clicks": stats["clicks"],
+                "repaired_mouth_noises": stats["mouth"],
+                "repaired_dropouts": stats["dropouts"],
+                "too_long_skipped": stats["skipped_long"],
                 "sensitivity": float(sensitivity),
                 "mouth_sensitivity": float(mouth_sensitivity),
                 "speech_protect": float(speech_protect),
                 "max_repair_ms": float(max_repair_ms),
+                "strength": amount,
+                "output": output,
             },
             indent=2,
         )
-        return ({"waveform": result, "sample_rate": sample_rate}, info)
+        return ({"waveform": out, "sample_rate": sample_rate}, info)
 
 
 class ReaperRoomMatchHybrid:
@@ -1614,13 +1920,12 @@ def _load_voice_isolator(mode, lookahead_frames, device):
     cached = _VOICE_ISOLATOR_CACHE.get(key)
     if cached is not None:
         return cached
-    try:
-        from inworld import voice_isolation
-    except ImportError as error:
-        raise RuntimeError(
-            "Inworld Voice Isolator is not installed. Install it in the ComfyUI "
-            "environment with: python -m pip install inworld-voice-isolation"
-        ) from error
+    _ensure_modules(
+        {"inworld.voice_isolation": "inworld-voice-isolation>=1.0.0"},
+        "Inworld Voice Isolator",
+    )
+    from inworld import voice_isolation
+
     model = _voice_isolator_local_checkpoint(mode) or "inworld/voice-isolator"
     isolator = voice_isolation.VoiceIsolator(
         model,
