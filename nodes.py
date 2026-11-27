@@ -677,7 +677,7 @@ class ReaperDynamicVoiceLeveler:
 
 
 class ReaperClearVoiceEnhance:
-    DESCRIPTION = "Full-band speech enhancement using ClearVoice MossFormer2_SE_48K. Requires the optional clearvoice package; models are downloaded on first use."
+    DESCRIPTION = "Full-band speech enhancement using ClearVoice MossFormer2_SE_48K. ClearVoice and the model install themselves on first use (no terminal needed)."
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -964,6 +964,7 @@ class ReaperAudioInpaint:
     ):
         if audio is None or "waveform" not in audio:
             raise ValueError("REAPER Audio Inpaint requires an AUDIO input")
+        _ensure_modules({"scipy.ndimage": "scipy"}, "REAPER Audio Inpaint")
         try:
             from scipy.ndimage import (
                 binary_closing,
@@ -974,7 +975,8 @@ class ReaperAudioInpaint:
             )
         except ImportError as error:
             raise RuntimeError(
-                "REAPER Audio Inpaint requires scipy. Install it with: pip install scipy"
+                "REAPER Audio Inpaint could not import scipy after installing it; "
+                "restart ComfyUI and run the node again"
             ) from error
         import numpy as np
 
@@ -1614,13 +1616,12 @@ def _load_voice_isolator(mode, lookahead_frames, device):
     cached = _VOICE_ISOLATOR_CACHE.get(key)
     if cached is not None:
         return cached
-    try:
-        from inworld import voice_isolation
-    except ImportError as error:
-        raise RuntimeError(
-            "Inworld Voice Isolator is not installed. Install it in the ComfyUI "
-            "environment with: python -m pip install inworld-voice-isolation"
-        ) from error
+    _ensure_modules(
+        {"inworld.voice_isolation": "inworld-voice-isolation>=1.0.0"},
+        "Inworld Voice Isolator",
+    )
+    from inworld import voice_isolation
+
     model = _voice_isolator_local_checkpoint(mode) or "inworld/voice-isolator"
     isolator = voice_isolation.VoiceIsolator(
         model,

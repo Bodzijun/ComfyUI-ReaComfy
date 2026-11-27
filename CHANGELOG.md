@@ -2,6 +2,13 @@
 
 All notable changes to ReaComfy are documented here.
 
+## [0.6.2] - 2026-11-27
+
+### Changed
+
+- Voice Isolator and Audio Inpaint also install a missing `inworld-voice-isolation` / `scipy` on first use instead of asking for pip.
+- README and node descriptions no longer tell users to run `pip install clearvoice`: ClearVoice installs itself on first use (since 0.6.1). The generic "install modules with pip" section is replaced by a note on what installs itself.
+
 ## [0.6.1] - 2026-11-27
 
 ### Fixed
