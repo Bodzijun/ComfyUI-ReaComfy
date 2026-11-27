@@ -453,6 +453,20 @@ def test_ensure_modules_installs_only_missing(nodes, monkeypatch):
     assert calls == []
 
 
+def test_clearvoice_and_lavasr_install_without_pinned_deps(nodes, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        nodes, "_ensure_modules", lambda req, purpose, **kw: calls.append((req, kw))
+    )
+    nodes._ensure_clearvoice()
+    nodes._ensure_lavasr()
+    no_deps = [req for req, kw in calls if kw.get("no_deps")]
+    assert no_deps[0] == {"clearvoice:ClearVoice": "clearvoice==0.1.2"}
+    assert "LavaSR.model:LavaEnhance2" in no_deps[1]
+    assert all("git+" not in spec for spec in no_deps[1].values())
+    assert "numpy" not in str(calls)
+
+
 FAKE_ZONOS3_WORKER = r"""
 import json, sys, wave
 print("loading weights...", flush=True)  # noise the protocol must ignore
@@ -594,3 +608,36 @@ def test_zonos3_edit_worker_restarts_with_adapter(nodes, monkeypatch, tmp_path):
 def test_zonos3_worker_script_compiles(nodes):
     compile(nodes.ZONOS3_WORKER, "worker", "exec")
     compile(nodes.ZONOS3_WINSHIM, "winshim", "exec")
+
+
+def test_speech_edit_keeps_original_outside_the_fix(nodes):
+    import numpy as np
+
+    rate = 16000
+    rng = np.random.default_rng(0)
+    original = rng.standard_normal((2, rate * 4)).astype(np.float32) * 0.1
+    mono = original.mean(axis=0)
+    # The fix replaces 1.0-1.5 s of the original with a 0.8 s fill; the decoded
+    # clip is quieter (gain 0.5) and 5 ms late, like a codec would return it.
+    s0, s1, fill_len = rate, int(1.5 * rate), int(0.8 * rate)
+    fill = np.sin(np.arange(fill_len) / 7.0).astype(np.float32) * 0.2
+    decoded = np.concatenate([mono[:s0], fill, mono[s1:]]) * 0.5
+    lag = 80
+    decoded = np.concatenate([np.zeros(lag, np.float32), decoded[:-lag]])
+    out = nodes._splice_edit_into_original(
+        original,
+        decoded,
+        rate,
+        [[1.0, 1.5]],
+        [[1.0, 1.0 + fill_len / rate]],
+    )
+    assert out.shape == (2, decoded.shape[0])
+    # Untouched audio is the original itself (both channels, no codec, no lag).
+    assert np.allclose(out[:, : s0 - 2000], original[:, : s0 - 2000], atol=1e-6)
+    tail = s0 + fill_len + 2000
+    assert np.allclose(
+        out[:, tail:], original[:, s1 + 2000 :][:, : out.shape[1] - tail], atol=1e-6
+    )
+    # The fill is level-matched back to the original's loudness.
+    inside = out[:, s0 + 100 : s0 + fill_len - 100]
+    assert np.allclose(inside, fill[100 : fill_len - 100], atol=0.02)

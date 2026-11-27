@@ -74,12 +74,9 @@ does not restore missing bandwidth (chain `REAPER LavaSR v2` or
 
 ### ClearVoice / MossFormer2
 
-Required by `REAPER ClearVoice Enhance` and `REAPER ClearVoice Super
-Resolution`:
-
-```bash
-python -m pip install clearvoice
-```
+Used by `REAPER ClearVoice Enhance` and `REAPER ClearVoice Super Resolution`.
+ClearVoice installs itself on first use (without its pinned numpy/torch
+versions, so ComfyUI's own packages are left alone).
 
 The `MossFormer2_SE_48K` and `MossFormer2_SR_48K` checkpoints are downloaded
 automatically on first use. The enhancement node is intended for noisy speech;
@@ -91,14 +88,8 @@ the super-resolution node is best used after enhancement and always returns
 `REAPER LavaSR v2` is the recommended 48 kHz bandwidth-extension node for
 speech that was cloned, compressed, or processed at a lower rate. It downloads
 the LavaSR v2 checkpoint from Hugging Face on first use and returns 48 kHz
-audio. Install it in the active ComfyUI environment without reinstalling
-Torch:
-
-```bash
-python -m pip install git+https://github.com/ysharma3501/LavaSR.git
-python -m pip install --no-deps git+https://github.com/langtech-bsc/vocos.git@matcha
-python -m pip install --no-deps encodec
-```
+audio. LavaSR and its vocos fork install themselves on first use (from GitHub
+archives, no git needed; Torch is never reinstalled).
 
 Use `denoise` only when the input is noisy; for a cleaner chain, denoise first
 with a dedicated 48 kHz enhancer and then run LavaSR. `strength` blends the
@@ -182,6 +173,10 @@ Give it the selected REAPER item (keep it short: one or two sentences), the
   words that differ and only those are regenerated; or
 - `edit_start` / `edit_end`: the part to regenerate, in seconds from the clip
   start (useful when the aligner misplaces a word).
+
+Only the regenerated words are new: by default the original recording is kept
+everywhere else (`keep_original_audio`), crossfaded and level-matched, because
+ZONOS3 itself re-decodes the whole clip through its codec.
 
 `seed` 0 is random; change it for another take. The result is the whole clip
 with the fix, at the item's sample rate (`match_input_rate`). Clips longer than

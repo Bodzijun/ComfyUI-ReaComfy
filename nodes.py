@@ -706,13 +706,9 @@ class ReaperClearVoiceEnhance:
     def enhance(self, audio, model="MossFormer2_SE_48K", strength=1.0, device="auto"):
         if audio is None or "waveform" not in audio:
             raise ValueError("REAPER ClearVoice Enhance requires an AUDIO input")
-        try:
-            ensure_clearvoice_librosa_compat()
-            from clearvoice import ClearVoice
-        except ImportError as error:
-            raise RuntimeError(
-                "ClearVoice is not installed. Install it in the ComfyUI environment with: pip install clearvoice"
-            ) from error
+        _ensure_clearvoice()
+        ensure_clearvoice_librosa_compat()
+        from clearvoice import ClearVoice
         import tempfile
         import numpy as np
 
@@ -834,13 +830,10 @@ class ReaperClearVoiceSuperResolution:
             raise ValueError(
                 "REAPER ClearVoice Super Resolution requires an AUDIO input"
             )
-        try:
-            ensure_clearvoice_librosa_compat()
-            from clearvoice import ClearVoice
-        except ImportError as error:
-            raise RuntimeError(
-                "ClearVoice is not installed. Install it in the ComfyUI environment with: pip install clearvoice"
-            ) from error
+        _ensure_clearvoice()
+        ensure_clearvoice_librosa_compat()
+        from clearvoice import ClearVoice
+
         waveform = audio["waveform"].detach().float().cpu()
         source_rate = int(audio["sample_rate"])
         import numpy as np
@@ -1559,14 +1552,9 @@ class ReaperLavaSR:
             raise ValueError(
                 "REAPER LavaSR currently supports one audio batch at a time"
             )
-        try:
-            from LavaSR.model import LavaEnhance2
-        except ImportError as error:
-            raise RuntimeError(
-                "LavaSR is not installed. In the active ComfyUI environment run: "
-                "pip install git+https://github.com/ysharma3501/LavaSR.git "
-                "and pip install --no-deps git+https://github.com/langtech-bsc/vocos.git@matcha"
-            ) from error
+        _ensure_lavasr()
+        from LavaSR.model import LavaEnhance2
+
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = self._models.get(device)
         if model is None:
@@ -2647,14 +2635,15 @@ def _fit_length(samples, length):
     return torch.nn.functional.pad(samples, (0, length - samples.shape[-1]))
 
 
-def _ensure_modules(requirements, purpose, upgrade=False):
+def _ensure_modules(requirements, purpose, upgrade=False, no_deps=False):
     """Install missing Python modules into ComfyUI's own environment.
 
     requirements: {import_name: pip_spec}. REAPER users should never need a
     terminal, so missing optional modules are installed on first use with the
     interpreter that runs ComfyUI (sys.executable). Installed packages that
     are already satisfied (e.g. torch) are never upgraded unless upgrade=True
-    (used when an installed copy is present but broken).
+    (used when an installed copy is present but broken). no_deps=True installs
+    packages whose own metadata pins old numpy/torch versions without them.
     """
     import importlib
     import subprocess
@@ -2690,7 +2679,7 @@ def _ensure_modules(requirements, purpose, upgrade=False):
             "pip",
             "install",
             "--disable-pip-version-check",
-        ]
+        ] + (["--no-deps"] if no_deps else [])
         completed = subprocess.run(
             command + list(attempt) + list(missing),
             capture_output=True,
@@ -2713,6 +2702,51 @@ def _ensure_modules(requirements, purpose, upgrade=False):
         f"ComfyUI's Python ({sys.executable}):\n{details}\nRestart ComfyUI and run "
         "the node again; if it persists, send this message to the ReaComfy thread."
     )
+
+
+# ClearVoice's package metadata pins numpy<2, opencv, torchvision and an old
+# soundfile, which would downgrade ComfyUI. Its speech models only need the
+# modules below, so the package itself is installed without dependencies.
+CLEARVOICE_MODULES = {
+    "yamlargparse": "yamlargparse",
+    "librosa": "librosa",
+    "pydub": "pydub",
+    "rotary_embedding_torch": "rotary-embedding-torch==0.8.3",
+    "torchinfo": "torchinfo",
+    "einops": "einops",
+    "huggingface_hub": "huggingface_hub",
+    "tqdm": "tqdm",
+}
+if sys.version_info >= (3, 13):
+    CLEARVOICE_MODULES["audioop"] = "audioop-lts"  # pydub on Python 3.13+
+
+
+def _ensure_clearvoice():
+    _ensure_modules(CLEARVOICE_MODULES, "ClearVoice")
+    _ensure_modules(
+        {"clearvoice:ClearVoice": "clearvoice==0.1.2"}, "ClearVoice", no_deps=True
+    )
+
+
+# LavaSR and its vocos fork come from GitHub archives (no git needed); vocos
+# and encodec pin nothing useful, so they are installed without dependencies.
+LAVASR_MODULES = {
+    "librosa": "librosa",
+    "einops": "einops",
+    "yaml": "pyyaml",
+    "huggingface_hub": "huggingface_hub",
+    "scipy": "scipy",
+}
+LAVASR_NO_DEPS = {
+    "encodec": "encodec",
+    "vocos": "vocos @ https://codeload.github.com/langtech-bsc/vocos/zip/refs/heads/matcha",
+    "LavaSR.model:LavaEnhance2": "LavaSR @ https://codeload.github.com/ysharma3501/LavaSR/zip/refs/heads/main",
+}
+
+
+def _ensure_lavasr():
+    _ensure_modules(LAVASR_MODULES, "LavaSR")
+    _ensure_modules(LAVASR_NO_DEPS, "LavaSR", no_deps=True)
 
 
 def _download_github_zip(owner_repo, target, marker):
@@ -3997,11 +4031,113 @@ def zonos3_edit_request(
     return request
 
 
+def _splice_edit_into_original(
+    original, edited, rate, spans, regions, fade_seconds=0.04
+):
+    """Keep the original recording outside the edited regions.
+
+    ZONOS3 decodes the whole clip from its 15 fps codec, so even the untouched
+    words come back re-synthesized (slightly different timbre and micro-
+    intonation). Here only the regenerated stretches of ``edited`` are used:
+    original: [C, N] at ``rate``; edited: [M] mono at ``rate``; spans: [start,
+    end] seconds in the original; regions: [start, end] seconds in ``edited``.
+    Joins are raised-cosine crossfades placed just outside each region, the
+    fill is level-matched to the original over the unedited audio, and a small
+    codec latency (up to 60 ms) is compensated by cross-correlation.
+    """
+    import numpy as np
+
+    original = np.asarray(original, dtype=np.float32)
+    if original.ndim == 1:
+        original = original[None]
+    edited = np.asarray(edited, dtype=np.float32).reshape(-1)
+    channels, n_orig = original.shape
+    n_out = edited.shape[0]
+    pairs = sorted(
+        (
+            (round(s0 * rate), round(s1 * rate)),
+            (round(e0 * rate), round(e1 * rate)),
+        )
+        for (s0, s1), (e0, e1) in zip(spans or [], regions or [])
+    )
+    if not pairs:
+        return original
+    # Map every output sample outside the regions to its original sample.
+    source = np.full(n_out, -1, dtype=np.int64)
+    inside = np.zeros(n_out, dtype=bool)
+    out_cursor, orig_cursor = 0, 0
+    for (s0, s1), (e0, e1) in pairs:
+        length = max(0, min(e0, n_out) - out_cursor)
+        source[out_cursor : out_cursor + length] = np.arange(
+            orig_cursor, orig_cursor + length
+        )
+        inside[max(0, e0) : min(n_out, e1)] = True
+        out_cursor, orig_cursor = max(out_cursor, e1), s1
+    length = max(0, n_out - out_cursor)
+    source[out_cursor:] = np.arange(orig_cursor, orig_cursor + length)
+    valid = (source >= 0) & (source < n_orig) & ~inside
+    mono = original.mean(axis=0)
+
+    # Codec latency: the lag of edited against the original on unedited audio.
+    lag = 0
+    idx = np.flatnonzero(valid)
+    if idx.size > rate // 2:
+        stretch = idx[: min(idx.size, rate * 8)]
+        a = mono[source[stretch]]
+        b = edited[stretch]
+        max_lag = int(0.06 * rate)
+        size = 1 << int(np.ceil(np.log2(len(a) + len(b))))
+        corr = np.fft.irfft(np.fft.rfft(b, size) * np.conj(np.fft.rfft(a, size)), size)
+        window = np.concatenate([corr[-max_lag:], corr[: max_lag + 1]])
+        best = int(np.argmax(window)) - max_lag
+        norm = float(np.linalg.norm(a) * np.linalg.norm(b)) or 1.0
+        if window.max() / norm > 0.3:
+            lag = best  # edited[t + lag] ~ original[source[t]]
+    if lag:
+        # Pull the decoded clip back onto the original's timeline.
+        moved = np.zeros_like(edited)
+        if lag > 0:
+            moved[:-lag] = edited[lag:]
+        else:
+            moved[-lag:] = edited[:lag]
+        edited = moved
+    shifted = source
+
+    # Level: match the fill to the original's loudness on the unedited audio.
+    ref = mono[shifted[valid]]
+    test = edited[valid]
+    gain = 1.0
+    if ref.size > rate // 4:
+        rms_ref = float(np.sqrt(np.mean(ref * ref)))
+        rms_test = float(np.sqrt(np.mean(test * test)))
+        if rms_ref > 1e-5 and rms_test > 1e-5:
+            gain = float(np.clip(rms_ref / rms_test, 0.25, 4.0))
+
+    # Weight of the edited audio: 1 inside regions, cosine ramps just outside.
+    weight = inside.astype(np.float32)
+    fade = max(1, int(fade_seconds * rate))
+    ramp = 0.5 - 0.5 * np.cos(np.linspace(0.0, np.pi, fade + 2, dtype=np.float32)[1:-1])
+    for _, (e0, e1) in pairs:
+        left = slice(max(0, e0 - fade), max(0, e0))
+        weight[left] = np.maximum(weight[left], ramp[fade - (left.stop - left.start) :])
+        right = slice(min(n_out, e1), min(n_out, e1 + fade))
+        weight[right] = np.maximum(
+            weight[right], ramp[::-1][: right.stop - right.start]
+        )
+    weight[~valid & ~inside] = 1.0  # no original sample to fall back on
+
+    out = np.zeros((channels, n_out), dtype=np.float32)
+    dry = np.zeros((channels, n_out), dtype=np.float32)
+    dry[:, valid] = original[:, shifted[valid]]
+    out[:] = weight * (edited * gain) + (1.0 - weight) * dry
+    return out
+
+
 class ReaperZonos3SpeechEdit:
     DESCRIPTION = (
         "Fixes a slip of the tongue in recorded speech with ZONOS3-Mini speech editing: only "
-        "the changed words are regenerated in the speaker's own voice, every other frame of "
-        "the recording stays untouched. Give the corrected text of the whole clip plus either "
+        "the changed words are regenerated in the speaker's own voice and spliced into the "
+        "original recording (keep_original_audio). Give the corrected text of the whole clip plus either "
         "the original text (the changed words are found automatically) or the edit region in "
         "seconds. Keep clips short (one or two sentences). Needs an NVIDIA GPU; the first run "
         "installs ZONOS3, FuseAlign and the edit adapter automatically."
@@ -4068,11 +4204,20 @@ class ReaperZonos3SpeechEdit:
                     "FLOAT",
                     {"default": 0.75, "min": 0.1, "max": 1.5, "step": 0.05},
                 ),
+                "keep_original_audio": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Keep the original recording outside the fixed words (crossfaded, level-matched). "
+                        "Off = the whole clip as ZONOS3 decodes it, which re-synthesizes the untouched words too.",
+                    },
+                ),
                 "match_input_rate": (
                     "BOOLEAN",
                     {
                         "default": True,
-                        "tooltip": "Return the clip at its original sample rate (ZONOS3 works at 44.1 kHz).",
+                        "tooltip": "Return the clip at its original sample rate (ZONOS3 works at 44.1 kHz). "
+                        "Always on while keep_original_audio is on.",
                     },
                 ),
                 "device": (["auto", "cuda"], {"default": "auto"}),
@@ -4090,6 +4235,7 @@ class ReaperZonos3SpeechEdit:
         edit_end=-1.0,
         seed=0,
         temperature=0.75,
+        keep_original_audio=True,
         match_input_rate=True,
         device="auto",
         timeout_s=1800,
@@ -4123,10 +4269,24 @@ class ReaperZonos3SpeechEdit:
         samples, out_rate, used_seed, info = _Zonos3Runtime.edit(
             request, device, int(timeout_s)
         )
-        if match_input_rate and out_rate != rate:
+        if (match_input_rate or keep_original_audio) and out_rate != rate:
             samples = _resample(samples, out_rate, rate)
             out_rate = rate
         info = dict(info, seed=used_seed, language=language)
+        spans, regions = info.get("spans"), info.get("edited_regions")
+        print(f"[ReaComfy] ZONOS3 edit regenerated (seconds of the original): {spans}")
+        if keep_original_audio and spans and regions:
+            spliced = _splice_edit_into_original(
+                waveform[0].numpy(), samples.reshape(-1).numpy(), rate, spans, regions
+            )
+            info["kept_original_audio"] = True
+            return (
+                {
+                    "waveform": torch.from_numpy(spliced).unsqueeze(0),
+                    "sample_rate": rate,
+                },
+                json.dumps(info, ensure_ascii=False),
+            )
         return (
             {"waveform": samples.reshape(1, 1, -1), "sample_rate": out_rate},
             json.dumps(info, ensure_ascii=False),

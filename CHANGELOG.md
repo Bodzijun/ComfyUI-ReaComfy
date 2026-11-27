@@ -2,6 +2,13 @@
 
 All notable changes to ReaComfy are documented here.
 
+## [0.6.1] - 2026-11-27
+
+### Fixed
+
+- ZONOS3 Speech Edit re-synthesized the whole clip: ZONOS3 decodes every frame through its codec, so even the untouched words came back with a slightly different timbre and intonation. The node now keeps the original recording outside the regenerated words (crossfaded, level-matched, codec delay compensated); `keep_original_audio` turns this off. The regenerated regions are printed to the ComfyUI console.
+- ClearVoice and LavaSR no longer need a terminal: they install themselves on first use, without their pinned numpy/torch versions (LavaSR from GitHub archives, no git needed).
+
 ## [0.6.0] - 2026-11-26
 
 ### Fixed
