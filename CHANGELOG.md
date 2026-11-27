@@ -2,6 +2,19 @@
 
 All notable changes to ReaComfy are documented here.
 
+## [0.6.3] - 2026-11-27
+
+### Changed
+
+- `REAPER Audio Inpaint / De-Click Repair` rebuilt. The old version barely changed anything: its repair faded the correction in and out across the damaged region, so even at full strength most of a click stayed. Now:
+  - Detection works on the whitened signal (short-term AR plus a 3-tap pitch predictor, forward and backward) and asks each candidate to stand out from the strongest events of the surrounding 40 ms, so pitch pulses, sibilants, drum hits and synth edges are not mistaken for clicks.
+  - Damaged regions are rebuilt with least-squares AR interpolation (LSAR) with an order that grows with the gap and pitch taps when the context is periodic, so voiced speech keeps its harmonics across the gap. Filled gaps keep a little of the surrounding noise texture instead of going hollow.
+  - Mouth/saliva noise is replaced only above 2 kHz; the voice below stays untouched. Digital dropouts (flat or zero runs) up to 50 ms are found and rebuilt in `auto` and `inpaint` mode.
+  - `strength` now scales the removal linearly (1.0 = defect fully replaced; default raised from 0.75 to 1.0).
+  - New optional `output` = `removed` returns only what was taken out, for checking.
+  - The info output counts clicks, mouth noises and dropouts separately.
+  On 30 s of speech with added clicks, mouth noise and dropouts the damage drops by about 12 dB (clicks), 9 dB (audible mouth noise) and 13 dB (dropouts); the old version changed them by 0 dB. Untouched audio stays within -44 dB of the original.
+
 ## [0.6.2] - 2026-11-27
 
 ### Changed
