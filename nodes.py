@@ -1066,6 +1066,50 @@ def _inpaint_fill(
     return fill
 
 
+def _inpaint_fix_low_band(
+    signal, begin, end, sample_rate, rng, lfilter, solve_toeplitz
+):
+    """Rebuild the low band (< 150 Hz) of a filled dropout at a 1 kHz rate.
+
+    At 48 kHz a short-term predictor spans well under a millisecond, far too
+    little to continue hum, rumble or a DC offset across a gap, so the fill
+    sags and the edges thump. At 1 kHz the same interpolation sees 200 ms of
+    the low band and continues it smoothly; only that band is replaced.
+    """
+    import numpy as np
+    from scipy.signal import butter, sosfiltfilt
+
+    factor = int(sample_rate // 1000)
+    if factor < 8:
+        return signal
+    low_rate = sample_rate / factor
+    gap = end - begin
+    context = max(int(sample_rate * 0.2), 8 * gap)
+    lo = max(0, begin - context)
+    hi = min(len(signal), end + context)
+    lowpass = butter(4, 150.0 / (sample_rate / 2.0), "low", output="sos")
+    band = sosfiltfilt(lowpass, signal[lo:hi])
+    low = band[::factor]
+    margin = int(np.ceil(0.006 * low_rate))  # reach of the 150 Hz filter
+    g0 = max(0, (begin - lo) // factor - margin)
+    g1 = min(len(low), -(-(end - lo) // factor) + margin)
+    if g0 < 24 or g1 > len(low) - 24:
+        return signal
+    order = int(min(max(24, 2 * (g1 - g0)), 64))
+    fill = _inpaint_fill(
+        low, g0, g1, order, low_rate, 0.0, rng, lfilter, solve_toeplitz
+    )
+    if fill is None:
+        return signal
+    diff = np.zeros(len(low))
+    diff[g0:g1] = fill - low[g0:g1]
+    positions = np.arange(hi - lo) / factor
+    correction = np.interp(positions, np.arange(len(low)), diff)
+    out = signal.copy()
+    out[lo:hi] += sosfiltfilt(lowpass, correction)
+    return out
+
+
 class ReaperAudioInpaint:
     DESCRIPTION = (
         "CPU repair of clicks, mouth/saliva noise and short dropouts. Detects defects "
@@ -1313,6 +1357,12 @@ class ReaperAudioInpaint:
         ratio = 1.0 + 2.5 * float(np.clip(speech_protect, 0.0, 1.0))
         max_samples = max(2, int(float(max_repair_ms) * sample_rate / 1000.0))
         dropout_max = max(max_samples, int(sample_rate * 0.05))
+        click_split = butter(
+            2,
+            min(120.0, 0.45 * sample_rate) / (sample_rate / 2.0),
+            "high",
+            output="sos",
+        )
         hf_split = butter(
             4,
             min(2000.0, 0.45 * sample_rate) / (sample_rate / 2.0),
@@ -1370,15 +1420,40 @@ class ReaperAudioInpaint:
                     )
                     if fill is None:
                         continue
-                    if band_split:
-                        pad = int(sample_rate * 0.004)
+                    if not is_dropout:
+                        # Only the band above the split is replaced, so the
+                        # repair can never change the low end (rumble, hum,
+                        # DC, the body of the voice) and cause a thump.
+                        split = hf_split if band_split else click_split
+                        pad = int(sample_rate * (0.004 if band_split else 0.02))
                         lo, hi = max(0, begin - pad), min(length, end + pad)
                         delta = np.zeros(hi - lo)
                         delta[begin - lo : end - lo] = fill - data[channel, begin:end]
-                        data[channel, lo:hi] += amount * sosfiltfilt(hf_split, delta)
+                        delta = sosfiltfilt(split, delta)
+                        ramp = min(begin - lo, hi - end)
+                        if ramp > 8:
+                            fade = np.ones(hi - lo)
+                            edge = 0.5 - 0.5 * np.cos(np.linspace(0, np.pi, ramp))
+                            fade[:ramp] = edge
+                            fade[-ramp:] = edge[::-1]
+                            delta *= fade
+                        data[channel, lo:hi] += amount * delta
                     else:
-                        data[channel, begin:end] += amount * (
-                            fill - data[channel, begin:end]
+                        repaired = data[channel].copy()
+                        repaired[begin:end] = fill
+                        repaired = _inpaint_fix_low_band(
+                            repaired,
+                            begin,
+                            end,
+                            sample_rate,
+                            rng,
+                            lfilter,
+                            solve_toeplitz,
+                        )
+                        lo = max(0, begin - int(sample_rate * 0.1))
+                        hi = min(length, end + int(sample_rate * 0.1))
+                        data[channel, lo:hi] += amount * (
+                            repaired[lo:hi] - data[channel, lo:hi]
                         )
                 if is_dropout:
                     stats["dropouts"] += 1

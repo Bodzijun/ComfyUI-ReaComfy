@@ -10,6 +10,7 @@ All notable changes to ReaComfy are documented here.
   - Detection works on the whitened signal (short-term AR plus a 3-tap pitch predictor, forward and backward) and asks each candidate to stand out from the strongest events of the surrounding 40 ms, so pitch pulses, sibilants, drum hits and synth edges are not mistaken for clicks.
   - Damaged regions are rebuilt with least-squares AR interpolation (LSAR) with an order that grows with the gap and pitch taps when the context is periodic, so voiced speech keeps its harmonics across the gap. Filled gaps keep a little of the surrounding noise texture instead of going hollow.
   - Mouth/saliva noise is replaced only above 2 kHz; the voice below stays untouched. Digital dropouts (flat or zero runs) up to 50 ms are found and rebuilt in `auto` and `inpaint` mode.
+  - No low-frequency thumps at the repair edges: clicks and mouth noise replace only the band above 120 Hz / 2 kHz (hum, rumble, DC offset and the body of the voice stay original), and the low band of a dropout is rebuilt separately at 1 kHz so hum and rumble continue through the gap.
   - `strength` now scales the removal linearly (1.0 = defect fully replaced; default raised from 0.75 to 1.0).
   - New optional `output` = `removed` returns only what was taken out, for checking.
   - The info output counts clicks, mouth noises and dropouts separately.
